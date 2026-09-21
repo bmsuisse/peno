@@ -3023,7 +3023,10 @@ impl RuntimeCoreState {
 
         enum SyncCallError {
             Runtime(RuntimeError),
-            Js(JsError),
+            // Boxed: `JsError` carries the whole stack-frame vector, so an
+            // inline variant makes every `Ok` return on this path pay for the
+            // error case (clippy::result_large_err).
+            Js(Box<JsError>),
         }
 
         let call_outcome: Result<SyncCallOutcome, SyncCallError> = (|| {
@@ -3084,7 +3087,7 @@ impl RuntimeCoreState {
                             v8::PromiseState::Rejected => {
                                 let exception = promise.result(try_catch);
                                 let js_error = JsError::from_v8_exception(try_catch, exception);
-                                Err(SyncCallError::Js(*js_error))
+                                Err(SyncCallError::Js(js_error))
                             }
                         }
                     } else {
@@ -3103,7 +3106,7 @@ impl RuntimeCoreState {
                 None => match try_catch.exception() {
                     Some(exception) => {
                         let js_error = JsError::from_v8_exception(try_catch, exception);
-                        Err(SyncCallError::Js(*js_error))
+                        Err(SyncCallError::Js(js_error))
                     }
                     None => Err(SyncCallError::Runtime(RuntimeError::internal(
                         "Function call failed with no exception",
@@ -3120,7 +3123,7 @@ impl RuntimeCoreState {
                 Ok(FunctionCallResult::Pending { call_id })
             }
             Err(SyncCallError::Runtime(err)) => Err(err),
-            Err(SyncCallError::Js(js_error)) => Err(self.translate_js_error(js_error)),
+            Err(SyncCallError::Js(js_error)) => Err(self.translate_js_error(*js_error)),
         }
     }
 
