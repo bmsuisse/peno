@@ -90,9 +90,26 @@ impl JsExceptionDetails {
 #[derive(Debug, Clone)]
 pub enum RuntimeError {
     JavaScript(JsExceptionDetails),
-    Timeout { context: String },
-    Internal { context: String },
-    Terminated { reason: Option<String> },
+    Timeout {
+        context: String,
+    },
+    Internal {
+        context: String,
+    },
+    Terminated {
+        reason: Option<String>,
+    },
+    /// The runtime stopped answering after a termination was requested and was
+    /// abandoned once the force-kill grace period expired.
+    ///
+    /// Distinct from [`RuntimeError::Terminated`] on purpose: `Terminated`
+    /// means the isolate acknowledged the kill and shut down cleanly, while
+    /// this means it never acknowledged it. The runtime thread has been given
+    /// up on rather than reclaimed, so the `Runtime` that produced this error
+    /// is permanently unusable and the caller must create a new one.
+    ForceKilled {
+        context: String,
+    },
 }
 
 impl RuntimeError {
@@ -122,11 +139,19 @@ impl RuntimeError {
         }
     }
 
+    pub fn force_killed(context: impl Into<String>) -> Self {
+        Self::ForceKilled {
+            context: context.into(),
+        }
+    }
+
     /// Access the stored context message for non-JavaScript errors.
     pub fn context(&self) -> Option<&str> {
         match self {
             Self::JavaScript(_) => None,
-            Self::Timeout { context } | Self::Internal { context } => Some(context.as_str()),
+            Self::Timeout { context }
+            | Self::Internal { context }
+            | Self::ForceKilled { context } => Some(context.as_str()),
             Self::Terminated { reason } => reason.as_deref().or(Some("Runtime terminated")),
         }
     }
@@ -136,7 +161,9 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::JavaScript(details) => write!(f, "{}", details.summary()),
-            Self::Timeout { context } | Self::Internal { context } => f.write_str(context),
+            Self::Timeout { context }
+            | Self::Internal { context }
+            | Self::ForceKilled { context } => f.write_str(context),
             Self::Terminated { reason } => {
                 f.write_str(reason.as_deref().unwrap_or("Runtime terminated"))
             }

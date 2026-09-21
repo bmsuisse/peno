@@ -211,6 +211,37 @@ So the scaling ceiling for session affinity is now what this document always
 claimed it was — thread count and memory, bounded by an LRU — rather than the
 core count. The recommendation stands unchanged; it just actually works now.
 
+### Termination is now bounded for every stuck shape
+
+Parking the dispatcher exposed a second, older hole worth stating here, because
+a session-affinity host is exactly the thing that needs to trust it. A retained
+`Runtime` has to be killable on demand, and `TerminationHandle.terminate()` —
+the only kill switch callable from a watchdog thread — could not kill a runtime
+parked on a pending promise. It flips a flag and calls V8's
+`terminate_execution()`, and V8 only acts on that when it next *enters*
+JavaScript; a drained-but-pending event loop never does. Nothing in the
+dispatcher read the flag, so `new Promise(() => {})` was unkillable and the
+caller blocked for the life of the process. This was measured identically
+against 0.1.0's busy-spin loop, so it was never a parking regression — just a
+gap that parking made impossible to keep ignoring.
+
+**Also fixed in 0.2.0.** The dispatcher checks the termination flag between
+polls, which kills all three parked shapes in **~1.7–2.1 ms median** (worst case
+3.4 ms) instead of never. `while(true){}` still dies by V8 unwinding JS directly
+at ~0.12 ms and does not pay for the poll interval, and a politely killed
+runtime keeps its bound host functions and globals — a `timeout=` never costs
+you your runtime. `timeout=` itself was already honest on parked promises and is
+unchanged at ~302 ms for a 300 ms limit.
+
+The one case no polite tier can reach is a runtime whose *thread* is wedged
+inside a host callback that never returns. `RuntimeConfig(force_kill_grace=...)`
+bounds that too, raising `RuntimeForceKilled` and abandoning the thread, but it
+is opt-in: it costs ~10% per synchronous call, and it cannot reclaim the isolate,
+only give up on it. If you run untrusted *Python* callbacks behind your tools,
+set it; if your host functions are your own code, the polite tiers are enough.
+See `BENCHMARKS.md` for the numbers and
+`tests/test_parked_termination.py` for the regression tests.
+
 ## Can global-state reset ever be trusted?
 
 **Position: no. Do not build a reset API. It is a trap, and the measurement

@@ -24,6 +24,8 @@ __all__ = [
     "JsStream",
     "JsUndefined",
     "RuntimeTerminated",
+    "RuntimeForceKilled",
+    "SUGGESTED_FORCE_KILL_GRACE",
     "SnapshotBuilder",
     "IsolatePool",
     "PooledIsolate",
@@ -108,6 +110,7 @@ class RuntimeConfig:
         snapshot: bytes | None = None,
         max_serialization_depth: int | None = None,
         max_serialization_bytes: int | None = None,
+        force_kill_grace: float | int | timedelta | None = None,
     ) -> None:
         """
         Create a new runtime configuration.
@@ -131,6 +134,12 @@ class RuntimeConfig:
             snapshot: Optional V8 startup snapshot bytes
             max_serialization_depth: Maximum nesting depth when transferring values
             max_serialization_bytes: Maximum serialized byte size when transferring values
+            force_kill_grace: How long a blocked caller waits for the runtime to
+                acknowledge a termination before abandoning the runtime thread and
+                raising ``RuntimeForceKilled``. ``None`` (the default) waits forever.
+                Only needed for a runtime wedged in a host callback that never
+                returns; runaway JS and never-resolving promises are already bounded.
+                Enabling it costs roughly 10% per synchronous call.
         """
         ...
 
@@ -222,6 +231,16 @@ class RuntimeConfig:
     @max_serialization_bytes.setter
     def max_serialization_bytes(self, value: int) -> None:
         """Set the maximum byte size allowed when serializing values."""
+        ...
+
+    @property
+    def force_kill_grace(self) -> float | None:
+        """Grace period in seconds before abandoning an unresponsive runtime."""
+        ...
+
+    @force_kill_grace.setter
+    def force_kill_grace(self, value: float | int | timedelta | None) -> None:
+        """Set the force-kill grace period; ``None`` disables the escalation."""
         ...
 
     def __repr__(self) -> str: ...
@@ -536,6 +555,26 @@ class RuntimeTerminated(RuntimeError):
 
     def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
+
+class RuntimeForceKilled(RuntimeTerminated):
+    """Raised when a runtime never acknowledged a termination and was abandoned.
+
+    Only possible when ``RuntimeConfig.force_kill_grace`` is set. Unlike
+    ``RuntimeTerminated`` -- which means the isolate acknowledged the kill and
+    shut down cleanly -- this means it never did: the runtime thread has been
+    given up on rather than reclaimed, so the ``Runtime`` that raised this is
+    permanently unusable and a replacement must be created. Bound host
+    functions, module state and globals do not carry over.
+
+    Subclasses ``RuntimeTerminated``, so existing handlers keep working.
+    """
+
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+
+SUGGESTED_FORCE_KILL_GRACE: float
+"""A reasonable ``force_kill_grace`` (0.1s): ~28x the slowest measured polite
+kill, so a runtime that would have died politely always gets the chance to."""
 
 class Runtime:
     """

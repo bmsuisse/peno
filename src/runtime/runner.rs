@@ -301,6 +301,17 @@ impl TerminationController {
         self.inner.status.load(Ordering::SeqCst) == TERMINATION_STATUS_TERMINATED
     }
 
+    /// Mark the isolate terminated from the *host* side, without the runtime
+    /// thread having acknowledged anything.
+    ///
+    /// Used only by the force-kill escalation in `RuntimeHandle::recv_result`,
+    /// where the runtime thread is wedged and will never mark itself. Normal
+    /// termination goes through the runtime thread's own
+    /// `finalize_termination` -> `mark_terminated`.
+    pub fn force_mark_terminated(&self) {
+        self.mark_terminated();
+    }
+
     fn mark_terminated(&self) -> bool {
         self.inner
             .status
@@ -420,11 +431,13 @@ pub enum RuntimeCommand {
 /// of a core and only applies for the bounded stretch during which async work
 /// is genuinely outstanding.
 ///
-/// Note it does *not* rescue `TerminationHandle::terminate` against a runtime
-/// parked on a pending promise. `terminate_execution()` only trips when V8
-/// next enters JavaScript, and a drained-but-pending event loop never does, so
-/// that case does not interrupt -- measured identically on 0.1.0's busy-spin
-/// loop, i.e. a pre-existing limitation of the handle and not of parking.
+/// It is also what bounds `TerminationHandle::terminate` against a runtime
+/// parked on a pending promise. `terminate_execution()` alone cannot help
+/// there -- it only trips when V8 next enters JavaScript, and a
+/// drained-but-pending event loop never does -- so the `2b.` block in `run`
+/// reads the termination flag directly instead, and this tick is what
+/// guarantees it is reached promptly (measured ~1.4-1.8ms median). Before that
+/// check existed such a runtime was unkillable.
 const PENDING_WORK_TICK: Duration = Duration::from_millis(1);
 
 /// Waker handed to `poll_event_loop`, replacing the `noop_waker` this
@@ -606,6 +619,47 @@ impl RuntimeDispatcher {
                 }
             }
 
+            // 2b. Honour a termination request raised from another thread.
+            //
+            // `TerminationHandle::terminate()` is the only kill switch callable
+            // from off-thread (it wraps the `Send` `v8::IsolateHandle`), and all
+            // it can do is flip the shared status flag and call V8's
+            // `terminate_execution()`. That second half is a no-op against a
+            // runtime parked on a *pending promise*: `terminate_execution()`
+            // only trips when V8 next **enters** JavaScript, and a
+            // drained-but-pending event loop never re-enters. Nothing else in
+            // this loop consulted the flag, so the request was simply never
+            // observed and the caller blocked on its result channel forever --
+            // `new Promise(() => {})` was unkillable.
+            //
+            // Checking the flag here closes that hole without any new timer:
+            // a runtime with a job in flight is already waking at least every
+            // `PENDING_WORK_TICK`, so this is observed within a tick (measured
+            // ~1ms; see BENCHMARKS.md) and costs one atomic load per iteration.
+            //
+            // This is the *polite* tier and deliberately does not recreate
+            // anything: bound host functions, module state and the isolate are
+            // left to the normal termination path, exactly as a `while(true){}`
+            // kill already behaved. It matches `RuntimeCommand::Terminate`
+            // (cancel the work, finalize, exit) because a termination request
+            // already makes `should_reject_new_work()` true, so the runtime
+            // would reject every later command anyway.
+            //
+            // It cannot help when the dispatcher *thread itself* is wedged
+            // inside a host call that never returns (a blocking sync op), since
+            // then this line never runs. That case is what the bounded
+            // escalation in `RuntimeHandle` exists for -- see
+            // `FORCE_KILL_GRACE`.
+            if self.core.should_reject_new_work() && self.has_work() {
+                log::debug!("Observed off-thread termination request; aborting in-flight work");
+                let termination_error = self.core.terminated_error();
+                self.cancel_all_jobs(termination_error);
+                if let Err(err) = self.core.finalize_termination() {
+                    log::warn!("Failed to finalize termination after abort: {err}");
+                }
+                break;
+            }
+
             // 3. ASYNCHRONOUSLY wait for something to actually happen.
             //
             // This step used to `select!` between `cmd_rx.recv()` and
@@ -679,6 +733,34 @@ impl RuntimeDispatcher {
                 break;
             }
         }
+    }
+
+    /// Whether any job is active or queued.
+    fn has_work(&self) -> bool {
+        self.active_job.is_some() || !self.pending_jobs.is_empty()
+    }
+
+    /// Fail the active job and every queued job with `error`.
+    ///
+    /// Shared by the three paths that abandon in-flight work: an explicit
+    /// `Terminate` command, an off-thread termination request observed by
+    /// `run`, and the command channel closing unexpectedly.
+    fn cancel_all_jobs(&mut self, error: RuntimeError) {
+        if let Some(job) = self.active_job.take() {
+            log::debug!("Cancelling active job");
+            job.finish(&mut self.core, Err(error.clone()));
+        }
+
+        let pending_count = self.pending_jobs.len();
+        if pending_count > 0 {
+            log::debug!("Cancelling {pending_count} pending jobs");
+        }
+        while let Some(job) = self.pending_jobs.pop_front() {
+            job.finish(&mut self.core, Err(error.clone()));
+        }
+
+        // Clear task locals to prevent stale event loop references
+        self.core.clear_task_locals();
     }
 
     /// Handle a command - returns true if dispatcher should exit
@@ -1034,23 +1116,7 @@ impl RuntimeDispatcher {
             }
             RuntimeCommand::Terminate { responder } => {
                 let termination_error = self.core.terminated_error();
-                // Cancel active job if exists
-                if let Some(job) = self.active_job.take() {
-                    log::debug!("Terminating active job on interrupt");
-                    job.finish(&mut self.core, Err(termination_error.clone()));
-                }
-
-                // Cancel all pending jobs
-                let pending_count = self.pending_jobs.len();
-                if pending_count > 0 {
-                    log::debug!("Cancelling {pending_count} pending jobs");
-                }
-                while let Some(job) = self.pending_jobs.pop_front() {
-                    job.finish(&mut self.core, Err(termination_error.clone()));
-                }
-
-                // Clear task locals to prevent stale event loop references
-                self.core.clear_task_locals();
+                self.cancel_all_jobs(termination_error);
 
                 let result = self.core.finalize_termination();
                 let _ = responder.send(result);
@@ -1083,22 +1149,7 @@ impl RuntimeDispatcher {
             .termination
             .ensure_reason("Command channel closed unexpectedly");
         let termination_error = self.core.terminated_error();
-        if let Some(job) = self.active_job.take() {
-            log::debug!("Dropping active job after command channel closed");
-            job.finish(&mut self.core, Err(termination_error.clone()));
-        }
-
-        if !self.pending_jobs.is_empty() {
-            log::debug!(
-                "Cancelling {} pending jobs after command channel closed",
-                self.pending_jobs.len()
-            );
-        }
-        while let Some(job) = self.pending_jobs.pop_front() {
-            job.finish(&mut self.core, Err(termination_error.clone()));
-        }
-
-        self.core.clear_task_locals();
+        self.cancel_all_jobs(termination_error);
         if let Err(err) = self.core.finalize_termination() {
             log::warn!(
                 "Failed to finalize termination after command channel closed: {}",
@@ -2152,6 +2203,9 @@ impl RuntimeCoreState {
             snapshot,
             max_serialization_depth,
             max_serialization_bytes,
+            // Consumed by `RuntimeHandle`, which does the waiting; the runtime
+            // thread itself never needs it.
+            force_kill_grace: _,
         } = config;
 
         if initial_heap_size.is_some() && max_heap_size.is_none() {
@@ -2622,7 +2676,7 @@ impl RuntimeCoreState {
             RuntimeError::Timeout { context } | RuntimeError::Internal { context } => {
                 context.contains("execution terminated")
             }
-            RuntimeError::Terminated { .. } => true,
+            RuntimeError::Terminated { .. } | RuntimeError::ForceKilled { .. } => true,
         }
     }
 

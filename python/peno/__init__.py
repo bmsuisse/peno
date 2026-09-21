@@ -19,10 +19,12 @@ from ._peno import (
     PooledIsolate,
     Runtime,
     RuntimeConfig,
+    RuntimeForceKilled,
     RuntimeStats,
     RuntimeTerminated,
     SnapshotBuilder,
     TerminationHandle,
+    SUGGESTED_FORCE_KILL_GRACE,
     undefined,
 )
 from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
@@ -254,6 +256,8 @@ __all__ = [
     "RuntimeStats",
     "JavaScriptError",
     "RuntimeTerminated",
+    "RuntimeForceKilled",
+    "SUGGESTED_FORCE_KILL_GRACE",
     "undefined",
     "JsStream",
     "TerminationHandle",

@@ -10,6 +10,23 @@ use pyo3::prelude::*;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// Suggested grace period for [`RuntimeConfig::force_kill_grace`], for
+/// callers that want the escalation without picking a number themselves.
+///
+/// Chosen from measured polite-kill latency on this branch: a `while(true){}`
+/// interrupted by `terminate_execution()` returns in a median 0.11ms, and the
+/// slowest polite tier -- a runtime parked on a pending promise, which the
+/// dispatcher notices on its next `PENDING_WORK_TICK` -- has a median of
+/// ~1.4-1.8ms, a p95 of ~2.7ms and a worst case of 4.02ms across repeated
+/// 30-sample runs. 100ms is ~25x that worst case, so a runtime that was going
+/// to die politely always gets to, with a wide margin for a loaded machine,
+/// while still converting an unbounded hang into a bounded one. See
+/// BENCHMARKS.md.
+///
+/// Not a default: `force_kill_grace` is `None` unless asked for, because
+/// enabling it costs ~10% per call. See `RuntimeHandle::recv_result`.
+pub const SUGGESTED_FORCE_KILL_GRACE: Duration = Duration::from_millis(100);
+
 fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
     if host.trim().is_empty() {
         return Err(PyValueError::new_err("Inspector host cannot be empty"));
@@ -241,6 +258,23 @@ pub struct RuntimeConfig {
 
     /// Maximum serialized payload size for Python<->JS transfers (bytes).
     pub max_serialization_bytes: usize,
+
+    /// How long a blocked caller keeps waiting for the runtime to acknowledge
+    /// a termination before it gives up on the runtime thread entirely, or
+    /// `None` (the default) to wait forever.
+    ///
+    /// This exists for one narrow case: a runtime whose *thread* is wedged
+    /// inside a host callback that never returns, which no polite kill can
+    /// reach. It is **not** needed for runaway JavaScript or for a never
+    /// resolving promise -- both of those are already bounded by `timeout=`
+    /// and by `TerminationHandle.terminate()`.
+    ///
+    /// Enabling it makes every synchronous call wait in slices rather than one
+    /// block, which measured ~10% slower per call, so it is off unless asked
+    /// for. [`SUGGESTED_FORCE_KILL_GRACE`] is a reasonable value. See
+    /// `RuntimeHandle::recv_result` for the full semantics and
+    /// `docs/termination.md` for what the caller observes.
+    pub force_kill_grace: Option<Duration>,
 }
 
 impl Default for RuntimeConfig {
@@ -256,6 +290,7 @@ impl Default for RuntimeConfig {
             snapshot: None,
             max_serialization_depth: MAX_JS_DEPTH,
             max_serialization_bytes: MAX_JS_BYTES,
+            force_kill_grace: None,
         }
     }
 }
@@ -330,6 +365,7 @@ impl RuntimeConfig {
         snapshot = None,
         max_serialization_depth = None,
         max_serialization_bytes = None,
+        force_kill_grace = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -343,6 +379,7 @@ impl RuntimeConfig {
         snapshot: Option<&Bound<'_, PyAny>>,
         max_serialization_depth: Option<usize>,
         max_serialization_bytes: Option<usize>,
+        force_kill_grace: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         if bootstrap.is_some() && snapshot.is_some() {
             return Err(PyValueError::new_err(
@@ -407,6 +444,10 @@ impl RuntimeConfig {
         if let Some(bytes) = max_serialization_bytes {
             validate_serialization_bytes(bytes)?;
             config.max_serialization_bytes = bytes;
+        }
+
+        if let Some(grace) = force_kill_grace {
+            config.force_kill_grace = Some(RuntimeConfig::duration_from_py_timeout(grace)?);
         }
 
         Ok(config)
@@ -554,6 +595,23 @@ impl RuntimeConfig {
     #[getter]
     fn max_serialization_bytes(&self) -> usize {
         self.max_serialization_bytes
+    }
+
+    /// Get the force-kill grace period in seconds, or `None` if disabled.
+    #[getter]
+    fn force_kill_grace(&self) -> Option<f64> {
+        self.force_kill_grace.map(|d| d.as_secs_f64())
+    }
+
+    /// Set the force-kill grace period.
+    /// Accepts float/int as seconds or a `datetime.timedelta`; `None` disables.
+    #[setter]
+    fn set_force_kill_grace(&mut self, grace: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        self.force_kill_grace = match grace {
+            Some(value) => Some(RuntimeConfig::duration_from_py_timeout(value)?),
+            None => None,
+        };
+        Ok(())
     }
 
     /// Set maximum serialized byte size for Python<->JS transfers.
