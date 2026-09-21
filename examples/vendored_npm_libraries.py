@@ -22,11 +22,19 @@ structurally valid output files:
   1. pptxgenjs -- builds a real multi-slide .pptx (title slide, a table,
      a native chart, and an image), matching how Anthropic's published
      `pptx` skill (github.com/anthropics/skills, skills/pptx) actually
-     drives pptxgenjs. Needs two tiny polyfills: setTimeout/clearTimeout
-     (it schedules async work with them) and atob/btoa (base64 encode
-     paths inside the bundle).
+     drives pptxgenjs. The one polyfill it genuinely cannot do without is
+     setTimeout/clearTimeout, and it has to be a *deferring* one -- see the
+     note on POLYFILLS_PATH below, and `vendor/pptxgenjs/polyfills.js` for
+     which of the three globals are load-bearing and which are defensive.
   2. pdf-lib -- builds a real multi-page .pdf. Needs *no* polyfills at
      all; it's a genuinely browser-native library by design.
+
+This example fetches its bundles over the network, which is what makes it an
+example rather than a test. For the fuller pptxgenjs story -- a pinned,
+vendored bundle, a six-slide deck with a combo chart on a secondary axis, and
+validation all the way through python-pptx and a LibreOffice render -- see
+`examples/pptxgenjs_presentation.py`. For the hermetic regression guard, see
+`tests/test_vendored_bundle_execution.py`.
 
 IMPORTANT -- what this is NOT: this is not the same as giving guest JS a
 real `require()`/npm resolver. The guest code never gets to load anything
@@ -41,6 +49,7 @@ including a library that did NOT work with this pattern and why.
 
 import asyncio
 import base64
+import pathlib
 import zipfile
 from io import BytesIO
 
@@ -48,39 +57,41 @@ import httpx
 
 from peno import Runtime
 
-PPTXGENJS_URL = "https://cdn.jsdelivr.net/npm/pptxgenjs@4/dist/pptxgen.bundle.js"
-PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/pdf-lib@1/dist/pdf-lib.min.js"
+# Pinned exactly, not floated on `@4`: a bundle is only a meaningful thing to
+# have verified if you know which bytes you verified.
+PPTXGENJS_URL = "https://cdn.jsdelivr.net/npm/pptxgenjs@4.0.1/dist/pptxgen.bundle.js"
+PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"
 
-# The exact base64-alphabet atob/btoa pptxgenjs needs; V8 has no browser
-# base64 builtins by default.
-BASE64_POLYFILLS = """
-globalThis.setTimeout = function (fn) { fn(); return 0; };
-globalThis.clearTimeout = function () {};
-
-const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-globalThis.atob = function (input) {
-  let str = String(input).replace(/=+$/, "");
-  let output = "";
-  let bc = 0, bs, buffer, idx = 0;
-  for (; buffer = str.charAt(idx++); ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer, bc++ % 4)
-       ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
-    buffer = B64.indexOf(buffer);
-  }
-  return output;
-};
-globalThis.btoa = function (input) {
-  let str = String(input);
-  let output = "";
-  for (let block = 0, charCode, i = 0, map = B64;
-       str.charAt(i | 0) || (map = "=", i % 1);
-       output += map.charAt(63 & block >> 8 - i % 1 * 8)) {
-    charCode = str.charCodeAt(i += 3 / 4);
-    if (charCode > 0xFF) throw new Error("btoa: invalid character");
-    block = block << 8 | charCode;
-  }
-  return output;
-};
-"""
+# The host polyfills live in one reviewable file, shared with
+# `examples/pptxgenjs_presentation.py` and with the regression test
+# `tests/test_vendored_bundle_execution.py`, so there is a single source of
+# truth for a surface that is genuinely load-bearing.
+#
+# NOTE -- the setTimeout shim in there is backed by
+# `Promise.resolve().then()`, and that is not decoration. JSZip drives
+# `pres.write()` through `setImmediate`, which the bundle implements on top of
+# `setTimeout` once it finds no process/MessageChannel/document. Measured at
+# pptxgenjs 4.0.1:
+#
+#                                | global/self absent | global/self present
+#     setTimeout = fn => {}      |       hangs        |       hangs
+#     setTimeout = fn => fn()    |       works        |       hangs
+#     Promise.resolve().then(fn) |       works        |       works
+#
+# An earlier version of this example used the synchronous `fn => fn()` shim
+# and did not define `global`/`self`, which is the one combination where that
+# shim gets away with it. Since the shared polyfill file does define them, a
+# microtask-backed shim is now required -- and it is the only row that is
+# correct regardless of the rest of the polyfill set. See
+# `vendor/pptxgenjs/polyfills.js` and the coupling test in
+# `tests/test_vendored_bundle_execution.py`.
+POLYFILLS_PATH = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "vendor"
+    / "pptxgenjs"
+    / "polyfills.js"
+)
+BASE64_POLYFILLS = POLYFILLS_PATH.read_text()
 
 PPTX_SCRIPT = """
 const pres = new PptxGenJS();
@@ -155,10 +166,14 @@ def verify_pdf(raw: bytes) -> None:
 
 
 async def main() -> None:
-    print("Building a .pptx with the real pptxgenjs bundle (2 polyfills needed)...")
+    print(
+        "Building a .pptx with the real pptxgenjs bundle (deferring setTimeout needed)..."
+    )
     pptx_bytes = await run_pptxgenjs()
     verify_pptx(pptx_bytes)
-    print(f"  OK: {len(pptx_bytes)} bytes, 3 slides incl. table + chart, verified as real OOXML zip")
+    print(
+        f"  OK: {len(pptx_bytes)} bytes, 3 slides incl. table + chart, verified as real OOXML zip"
+    )
 
     print("Building a .pdf with the real pdf-lib bundle (no polyfills needed)...")
     pdf_bytes = await run_pdf_lib()
