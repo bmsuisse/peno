@@ -47,6 +47,7 @@ This directory contains practical examples demonstrating peno's features and use
 
 - [**markdown_parser.py**](markdown_parser.py) - Load external JS libraries (marked.js) from CDN and expose async functions to Python
 - [**vendored_npm_libraries.py**](vendored_npm_libraries.py) - Run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles, host-supplied polyfills only, no `require()`/npm access for guest code — see [`docs/guides/advanced/vendored-npm-libraries.md`](../docs/guides/advanced/vendored-npm-libraries.md) for the full pattern and what did/didn't work
+- [**pptxgenjs_presentation.py**](pptxgenjs_presentation.py) - The same pattern taken all the way: the pinned, unmodified 460,889-byte `pptxgenjs` 4.0.1 bundle from [`vendor/pptxgenjs/`](../vendor/pptxgenjs/) builds a six-slide deck (table, three native OOXML charts including a combo chart on a secondary axis, an embedded PNG), then validates it with `zipfile`, reads it back with `python-pptx`, and renders every slide to PNG via LibreOffice so you can actually look at it. No network needed. Hermetic regression guard: [`tests/test_vendored_bundle_execution.py`](../tests/test_vendored_bundle_execution.py)
 
 ### Concurrency
 
@@ -58,6 +59,8 @@ This directory contains practical examples demonstrating peno's features and use
 - [**pydantic_ai_agent.py**](pydantic_ai_agent.py) - A `pydantic-ai` `Agent` with a "code mode" tool: the model submits one JS batch script instead of N separate tool calls, run safely with a timeout (uses `FunctionModel` so it runs offline, no API key)
 
 Both examples need extra dependencies not required by `peno` itself: `uv sync --group examples` (or `pip install pydantic-ai fastmcp`).
+
+`pptxgenjs_presentation.py` also uses `python-pptx` (in the same `examples` group) to read its output back, and optionally LibreOffice + Poppler (`soffice`, `pdftoppm`) to render slides to PNG. The render step is skipped with a clear message if those aren't installed; validation still runs.
 
 ## Running Examples
 
