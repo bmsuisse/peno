@@ -461,7 +461,7 @@ class TestErrorMessageDisclosure:
         with Runtime(config) as rt:
             rt.bind_function("sink", lambda *a: "ok")
             message = rt.eval(
-                "try { %s; 'no-throw' } catch (e) { String(e && e.message) }" % payload
+                f"try {{ {payload}; 'no-throw' }} catch (e) {{ String(e && e.message) }}"
             )
 
         self._assert_no_internals(str(message), f"op error for {payload!r}")
@@ -484,7 +484,7 @@ class TestErrorMessageDisclosure:
                 "aWithheldAsyncToolName", a_withheld_async_tool, mode="async"
             )
             message = rt.eval(
-                "try { __host_op_sync__(%d) } catch (e) { String(e.message) }" % token
+                f"try {{ __host_op_sync__({token}) }} catch (e) {{ String(e.message) }}"
             )
         assert "aWithheldAsyncToolName" not in message, message
         self._assert_no_internals(message, "mode-mismatch error")
