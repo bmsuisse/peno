@@ -1,0 +1,90 @@
+name: Publish to PyPI
+
+# Runs only when a GitHub Release is published -- never on every push.
+# Actually publishing requires PyPI Trusted Publishing to be configured for
+# this exact repo + workflow on the PyPI project page first (see README).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build manylinux wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          # v8 >=150.1 (pulled in via deno_core >=0.409, see Cargo.toml) needs
+          # glibc's memfd_create (glibc >=2.27), which manylinux2014's glibc
+          # 2.17 lacks ("auto" resolved to manylinux2014 and the resulting
+          # wheel failed to import: "undefined symbol: memfd_create").
+          # manylinux_2_28 ships glibc 2.28.
+          manylinux: 2_28
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI (Trusted Publishing)
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/peno
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing (OIDC) -- no API token secret needed
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

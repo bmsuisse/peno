@@ -1,0 +1,6 @@
+/* Hide the site name in the sidebar on desktop only */
+@media screen and (min-width: 76.25em) {
+  .md-nav--primary .md-nav__title {
+    display: none;
+  }
+}

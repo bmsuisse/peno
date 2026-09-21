@@ -1,0 +1,110 @@
+site_name: peno
+site_description: JavaScript runtime for Python powered by V8 and Rust
+site_author: bmsuisse
+site_url: https://bmsuisse.github.io/peno
+
+repo_name: bmsuisse/peno
+repo_url: https://github.com/bmsuisse/peno
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - content.code.select
+    - navigation.path
+    - navigation.sections
+    - navigation.expand
+    - navigation.footer
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.annotate
+  palette:
+    - scheme: default
+      primary: black
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+nav:
+  - Introduction: index.md
+  - Quick Start: quickstart.md
+  - Documentation:
+      - Concepts:
+          - Runtime: concepts/runtime.md
+          - Code Evaluation: concepts/evaluation.md
+          - Type Conversion: concepts/types.md
+      - Guides:
+          - Bindings: guides/bindings.md
+          - Modules: guides/modules.md
+          - Advanced:
+              - WebAssembly: guides/advanced/webassembly.md
+              - Snapshots: guides/advanced/snapshots.md
+              - Inspector: guides/advanced/inspector.md
+              - Vendored npm Libraries: guides/advanced/vendored-npm-libraries.md
+              - Arrow IPC Dataframes: guides/advanced/arrow-ipc-dataframes.md
+  - Use Cases:
+      - Code Playground: use-cases/playground.md
+      - AI Agent Sandbox: use-cases/ai-agent.md
+      - Plugin System: use-cases/plugin-system.md
+      - Serverless Runtime: use-cases/serverless-runtime.md
+      - Workflow Orchestration: use-cases/workflow.md
+  - API Reference:
+      - peno Module: api/peno.md
+      - Runtime: api/runtime.md
+      - RuntimeConfig: api/config.md
+      - Types: api/types.md
+  - Design Notes:
+      - Tool-calling at pool speed: tool-calling-at-pool-speed.md
+  - Contributing:
+      - Development: contributing/development.md
+      - Architecture: contributing/architecture.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: ["docs/stubs"]
+          options:
+            relative_crossrefs: true
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            group_by_category: false
+            heading_level: 3
+            docstring_style: google
+            show_source: false
+            find_stubs_package: true
+
+markdown_extensions:
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+
+extra_css:
+  - stylesheets/extra.css
+
+watch:
+  - docs
+  - mkdocs.yml

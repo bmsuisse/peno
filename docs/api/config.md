@@ -1,0 +1,3 @@
+# `RuntimeConfig`
+
+::: peno.RuntimeConfig
