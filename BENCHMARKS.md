@@ -118,6 +118,68 @@ both include a dedicated leakage test: check out an isolate, set
 `globalThis.leaked`, release it, check out the *same* isolate again
 (guaranteed via a pool of size 1), and assert `typeof leaked === 'undefined'`.
 
+## Retained runtimes: idle cost and scaling (v0.2.0)
+
+Until v0.2.0, `RuntimeDispatcher::run` (`src/runtime/runner.rs`) selected
+between `cmd_rx.recv()` and `tokio::task::yield_now()`. `yield_now` is always
+immediately ready, so the loop never actually blocked: **every live `Runtime`
+burned CPU continuously for its whole lifetime, whether or not it had any work
+to do.** v0.2.0 parks the dispatcher when the event loop is drained and no job
+is queued, and waits on a real waker (plus the active job's exact deadline)
+while async work is in flight.
+
+This matters because retaining one warm `Runtime` per session is the fastest
+thing this library does (see the warm-tool-call figures in
+`docs/tool-calling-at-pool-speed.md`), and the busy-spin was what capped that
+pattern at roughly the core count. Measured on the environment above, with K
+retained runtimes each holding a bound host function, idle after one call:
+
+| K retained | idle CPU, v0.1.0 | idle CPU, v0.2.0 | per-call, v0.1.0 | per-call, v0.2.0 |
+|---|---|---|---|---|
+| 1 | 12.9% | **0.0%** | 15.4 µs | **9.8 µs** |
+| 4 | 65.3% | **0.0%** | 13.1 µs | **9.7 µs** |
+| 8 | 169.9% | **0.0%** | 14.5 µs | **9.6 µs** |
+| 16 | 514.3% | **0.0%** | 29.5 µs | **9.9 µs** |
+| 32 | 668.3% | **0.0%** | 35.1 µs | **9.7 µs** |
+| 64 | 684.1% | **0.0%** | 18.2 µs | **9.8 µs** |
+
+Idle CPU is `getrusage(RUSAGE_SELF)` user+system over a 2 s window with every
+runtime idle, as a percentage of one core (so 800% is this 8-core machine fully
+saturated). Per-call is the median of the best of five 1000-call trials of a
+warm `eval` that crosses into Python and back, run on one of the K live
+runtimes; the earlier trials in each run are slower purely from warm-up, and
+the full per-trial series is in the commit message for this change.
+
+Three things to read off it:
+
+- **Idle cost went from linear in K to zero.** v0.1.0 cost ~13% of a core per
+  idle runtime and saturated all 8 cores somewhere between K=16 and K=32. In
+  v0.2.0 idle runtimes are genuinely parked and measure 0.0% at every K.
+- **Per-call latency no longer degrades with K.** v0.1.0 was flat to K=8 and
+  then ~2.3x worse at K=16-32, where the spinning threads outnumbered the
+  cores. v0.2.0 is flat at ~9.8 µs from K=1 to K=64. The K=64 v0.1.0 row
+  reading *better* than K=32 is not a recovery: at that point the machine is
+  saturated and the numbers are dominated by scheduling noise, which is the
+  regime the change removes.
+- **v0.2.0 is also faster at K=1** (9.8 µs vs 15.4 µs), because the old
+  spinning dispatcher thread was competing with the calling Python thread even
+  in the single-runtime case.
+
+Async paths were re-measured to confirm parking costs them nothing
+(medians, `eval_async`):
+
+| Path | v0.1.0 | v0.2.0 |
+|---|---|---|
+| `eval_async` resolved promise | 56.3 µs | 53.6 µs |
+| `eval_async` microtask chain | 55.8 µs | 47.5 µs |
+| async `bind_function`, not awaited | 117.0 µs | 114.6 µs |
+| async `bind_function`, awaited | 152.0 µs | 120.2 µs |
+
+`tests/test_idle_cpu.py` is the permanent regression test for all of this. It
+asserts an idle-CPU budget per runtime and that per-call latency at K = 3x the
+core count stays within 2x of its own K=1 baseline; all four cases fail against
+v0.1.0's dispatcher and pass against v0.2.0's.
+
 ## Known pre-existing environment flake (not caused by this pooling work)
 
 While re-running these benchmarks, `cargo bench --features bench` and the

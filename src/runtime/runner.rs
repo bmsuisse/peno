@@ -403,6 +403,52 @@ pub enum RuntimeCommand {
     },
 }
 
+/// Safety-net poll interval used *only* while async JavaScript work is in
+/// flight, and never while the runtime is idle.
+///
+/// Nearly every wake the dispatcher needs is already exact: `DispatcherWaker`
+/// covers everything `deno_core` signals through the waker it is handed (a
+/// completing async op, a resolved promise, an armed timer), a command
+/// arriving wakes `cmd_rx.recv()`, and an active job's timeout is waited on to
+/// its precise deadline by `pending_work_wait`.
+///
+/// This bound is the backstop for progress that is *not* signalled through the
+/// waker. It is deliberately a safety net rather than a mechanism anything
+/// depends on: the alternative to a bounded wait is an unbounded one, and an
+/// unbounded wait turns any unsignalled wake into a permanent hang, where the
+/// old busy-spin would merely have burned CPU and recovered. 1ms costs ~0.1%
+/// of a core and only applies for the bounded stretch during which async work
+/// is genuinely outstanding.
+///
+/// Note it does *not* rescue `TerminationHandle::terminate` against a runtime
+/// parked on a pending promise. `terminate_execution()` only trips when V8
+/// next enters JavaScript, and a drained-but-pending event loop never does, so
+/// that case does not interrupt -- measured identically on 0.1.0's busy-spin
+/// loop, i.e. a pre-existing limitation of the handle and not of parking.
+const PENDING_WORK_TICK: Duration = Duration::from_millis(1);
+
+/// Waker handed to `poll_event_loop`, replacing the `noop_waker` this
+/// dispatcher used to pass.
+///
+/// A `noop_waker` discards every wake, which is why the loop previously had to
+/// re-poll continuously to notice that async work had progressed -- it had no
+/// other way to find out. With a real waker, `deno_core` registers it against
+/// its op driver and promise machinery and signals us when there is something
+/// to do, which is what lets the loop park instead of spin. This is the same
+/// contract `deno_core`'s own `run_event_loop` relies on
+/// (`poll_fn(|cx| self.poll_event_loop(cx, opts)).await`).
+///
+/// `Notify::notify_one` stores a permit when nobody is currently awaiting, so a
+/// wake that lands while we are mid-poll is not lost -- it is consumed by the
+/// next `notified()`.
+struct DispatcherWaker(Arc<tokio::sync::Notify>);
+
+impl futures::task::ArcWake for DispatcherWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.notify_one();
+    }
+}
+
 /// Dispatcher that multiplexes command processing with async job execution.
 ///
 /// Runs the main loop on the runtime thread, polling the V8 event loop, processing
@@ -416,6 +462,21 @@ struct RuntimeDispatcher {
     pending_jobs: std::collections::VecDeque<Box<dyn RuntimeJob>>,
     /// Currently executing job (if any).
     active_job: Option<Box<dyn RuntimeJob>>,
+    /// Set whenever a job becomes active; cleared by `run` after it has given
+    /// that job one un-waited iteration.
+    ///
+    /// A freshly activated job has not run yet, so its first `poll` is what
+    /// starts the work (`execute_script`, then a transition to a
+    /// promise-waiting state) and necessarily returns `Pending`. The promise it
+    /// is now waiting on is frequently *already* resolved -- `Promise.resolve`,
+    /// or a microtask chain that `poll_event_loop` drains in a single call --
+    /// so the job needs one more trip round the loop to observe that and
+    /// finish. Nothing signals the waker for this: no op is in flight and no
+    /// timer is armed, because the progress already happened. Without this
+    /// flag the dispatcher would wait on the safety-net tick for a resolution
+    /// that is sitting right there, putting a full tick of latency on every
+    /// single async call.
+    job_just_activated: bool,
 }
 
 impl RuntimeDispatcher {
@@ -425,27 +486,63 @@ impl RuntimeDispatcher {
             cmd_rx,
             pending_jobs: std::collections::VecDeque::new(),
             active_job: None,
+            job_just_activated: false,
         }
     }
 
+    /// How long the dispatcher may wait before re-polling, given the work
+    /// currently in flight.
+    ///
+    /// Bounded by [`PENDING_WORK_TICK`], and clamped down to an active job's
+    /// remaining timeout so the job's own deadline check fires on time rather
+    /// than up to a tick late. A deadline already in the past yields `ZERO`,
+    /// which re-polls immediately and lets the job report its timeout without
+    /// delay. The clamp is what keeps a never-resolving promise's `timeout=`
+    /// honest now that the loop no longer spins through that check.
+    fn pending_work_wait(&self) -> Duration {
+        let mut wait = PENDING_WORK_TICK;
+        if let Some(deadline) = self.active_job.as_ref().and_then(|job| job.deadline()) {
+            wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        wait
+    }
+
     async fn run(&mut self) {
+        // One waker for the whole loop. See `DispatcherWaker`: this replaces a
+        // `noop_waker`, and is what makes parking possible at all.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waker = futures::task::waker(Arc::new(DispatcherWaker(notify.clone())));
+
         loop {
             // 1. SYNCHRONOUSLY drive the JavaScript event loop
             // This advances all promises, timers, and async ops one tick
             // Non-blocking - returns immediately even if work is pending
-            let noop_waker = futures::task::noop_waker();
-            let mut cx = std::task::Context::from_waker(&noop_waker);
+            let mut cx = std::task::Context::from_waker(&waker);
             // deno_core 0.409 dropped `pump_v8_message_loop` (pumping is now
             // unconditional inside poll_event_loop).
             let poll_opts = PollEventLoopOptions {
                 wait_for_inspector: false,
             };
 
+            // Whether the event loop reported that it has *nothing* left to do.
+            //
+            // `poll_event_loop` returning `Ready` is deno_core's statement that
+            // no async op is in flight, no promise is awaiting a host result
+            // and no timer is armed; `Pending` means at least one of those is
+            // outstanding and the waker will be signalled when it progresses.
+            // That distinction is the whole basis for deciding between parking
+            // and polling below.
+            let event_loop_drained;
+
             // Check for event loop errors
             // Note: Termination errors (from timeout/abort) are expected and will be handled
             // by the job's own poll() method. Only fail the job on unexpected fatal errors.
             match self.core.js_runtime.poll_event_loop(&mut cx, poll_opts) {
                 std::task::Poll::Ready(Err(err)) => {
+                    // An error means the loop is not going to make further
+                    // progress on its own, so treat it as drained and let the
+                    // job below decide the outcome.
+                    event_loop_drained = true;
                     let runtime_err = self.core.translate_core_error(err);
 
                     // Check if this is a termination-related error (expected during timeout/abort)
@@ -462,6 +559,7 @@ impl RuntimeDispatcher {
                             completed_job.finish(&mut self.core, Err(runtime_err));
                             self.core.clear_task_locals();
                             if let Some(next_job) = self.pending_jobs.pop_front() {
+                                self.job_just_activated = true;
                                 self.active_job = Some(next_job);
                             }
                         } else {
@@ -472,8 +570,14 @@ impl RuntimeDispatcher {
                         continue;
                     }
                 }
-                std::task::Poll::Ready(Ok(())) | std::task::Poll::Pending => {
-                    // Normal - event loop completed or has pending work
+                std::task::Poll::Ready(Ok(())) => {
+                    // Normal - event loop ran everything it had.
+                    event_loop_drained = true;
+                }
+                std::task::Poll::Pending => {
+                    // Normal - async work is still outstanding. The waker is
+                    // registered, so we will be signalled on progress.
+                    event_loop_drained = false;
                 }
             }
 
@@ -492,6 +596,7 @@ impl RuntimeDispatcher {
 
                         // Start the next pending job if any
                         if let Some(next_job) = self.pending_jobs.pop_front() {
+                            self.job_just_activated = true;
                             self.active_job = Some(next_job);
                         }
                     }
@@ -501,21 +606,72 @@ impl RuntimeDispatcher {
                 }
             }
 
-            // 3. ASYNCHRONOUSLY wait for new commands or yield to allow other tasks to run
-            let should_exit = tokio::select! {
-                biased; // Prefer new commands to yielding
+            // 3. ASYNCHRONOUSLY wait for something to actually happen.
+            //
+            // This step used to `select!` between `cmd_rx.recv()` and
+            // `tokio::task::yield_now()`. Because `yield_now` is always
+            // immediately ready, the loop never blocked: every `Runtime` burned
+            // CPU continuously for its entire lifetime whether or not it had
+            // any work, and K retained runtimes cost K times that. Retaining a
+            // warm runtime per session -- the pattern this library is fastest
+            // at -- was therefore capped by core count rather than by memory.
+            //
+            // Now the loop distinguishes two states and blocks in both:
+            //
+            //   idle    -- the event loop is drained and no job is queued or
+            //              active, so nothing can happen until a command
+            //              arrives. Park on `recv()` with no timer at all.
+            //   pending -- async work is outstanding. Wait on the waker (which
+            //              fires when it progresses), on a command, or on the
+            //              bounded tick from `pending_work_wait()`.
+            //
+            // A newly activated job gets one immediate, un-waited iteration so
+            // it can observe an already-resolved promise -- see
+            // `job_just_activated`. At most one extra iteration per activation,
+            // so this cannot spin.
+            if std::mem::take(&mut self.job_just_activated) {
+                continue;
+            }
 
-                // New command from Python
-                cmd = self.cmd_rx.recv() => {
-                    match cmd {
-                        Some(cmd) => self.handle_command(cmd),
-                        None => self.handle_channel_closed(),
+            // Both arms are real awaits, so an idle runtime costs no CPU.
+            let idle =
+                event_loop_drained && self.active_job.is_none() && self.pending_jobs.is_empty();
+
+            let should_exit = if idle {
+                tokio::select! {
+                    biased; // Prefer new commands
+
+                    cmd = self.cmd_rx.recv() => {
+                        match cmd {
+                            Some(cmd) => self.handle_command(cmd),
+                            None => self.handle_channel_closed(),
+                        }
                     }
-                }
 
-                // No new commands - yield to allow tokio to schedule other tasks
-                _ = tokio::task::yield_now() => {
-                    false
+                    // A wake that landed while we were polling. Nothing should
+                    // be able to signal this once the loop is drained, but
+                    // honouring it costs one extra iteration and removes any
+                    // chance of sleeping through work, which is the failure
+                    // mode worth spending an arm on.
+                    _ = notify.notified() => false,
+                }
+            } else {
+                let wait = self.pending_work_wait();
+                tokio::select! {
+                    biased; // Prefer new commands
+
+                    cmd = self.cmd_rx.recv() => {
+                        match cmd {
+                            Some(cmd) => self.handle_command(cmd),
+                            None => self.handle_channel_closed(),
+                        }
+                    }
+
+                    // deno_core made progress on the outstanding work.
+                    _ = notify.notified() => false,
+
+                    // Job deadline, or the safety net -- see `PENDING_WORK_TICK`.
+                    _ = tokio::time::sleep(wait) => false,
                 }
             };
 
@@ -588,6 +744,7 @@ impl RuntimeDispatcher {
 
                 // Queue or activate the job
                 if self.active_job.is_none() {
+                    self.job_just_activated = true;
                     self.active_job = Some(Box::new(job));
                 } else {
                     // Another job is active - queue this one
@@ -728,6 +885,7 @@ impl RuntimeDispatcher {
 
                 // Queue or activate the job
                 if self.active_job.is_none() {
+                    self.job_just_activated = true;
                     self.active_job = Some(Box::new(job));
                 } else {
                     self.pending_jobs.push_back(Box::new(job));
@@ -788,6 +946,7 @@ impl RuntimeDispatcher {
 
                 // Queue or activate the job
                 if self.active_job.is_none() {
+                    self.job_just_activated = true;
                     self.active_job = Some(Box::new(job));
                 } else {
                     self.pending_jobs.push_back(Box::new(job));
@@ -819,6 +978,7 @@ impl RuntimeDispatcher {
                 let job = ResumeFunctionCallJob::new(pending, task_locals, responder);
 
                 if self.active_job.is_none() {
+                    self.job_just_activated = true;
                     self.active_job = Some(Box::new(job));
                 } else {
                     self.pending_jobs.push_back(Box::new(job));
@@ -843,6 +1003,7 @@ impl RuntimeDispatcher {
                 } else {
                     let job = StreamReadJob::new(stream_id, responder);
                     if self.active_job.is_none() {
+                        self.job_just_activated = true;
                         self.active_job = Some(Box::new(job));
                     } else {
                         self.pending_jobs.push_back(Box::new(job));
@@ -963,6 +1124,17 @@ trait RuntimeJob {
 
     /// Get the start time for stats tracking
     fn start_time(&self) -> Instant;
+
+    /// Absolute deadline after which this job's own `poll` will time out, if it
+    /// has one.
+    ///
+    /// The dispatcher needs this because every job enforces its timeout from
+    /// inside `poll` -- so a dispatcher that parked indefinitely while a job
+    /// was in flight would never reach that check and the timeout would never
+    /// fire. Exposing the deadline lets the wait be bounded by it exactly.
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// State machine for async JavaScript evaluation
@@ -1151,6 +1323,10 @@ impl RuntimeJob for EvalAsyncJob {
 
     fn start_time(&self) -> Instant {
         self.start_time
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 }
 
@@ -1467,6 +1643,10 @@ impl RuntimeJob for EvalModuleAsyncJob {
     fn start_time(&self) -> Instant {
         self.start_time
     }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
 }
 
 /// State machine for async function calls
@@ -1706,6 +1886,10 @@ impl RuntimeJob for CallFunctionAsyncJob {
     fn start_time(&self) -> Instant {
         self.start_time
     }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
 }
 
 /// Job that resumes a previously-started JS function by awaiting its stored promise.
@@ -1835,6 +2019,10 @@ impl RuntimeJob for ResumeFunctionCallJob {
 
     fn start_time(&self) -> Instant {
         self.start_time
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 }
 

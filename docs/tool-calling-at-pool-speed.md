@@ -47,6 +47,16 @@ keyed by session id, with LRU + idle-TTL eviction. Do not reset it. Do not
 pool it. Do not fork `deno_core`.** The expensive-looking parts of the
 problem were artifacts of measuring the wrong baseline.
 
+> **Update, peno 0.2.0.** As first written, this document had one load-bearing
+> error: it assumed a retained `Runtime`'s thread was *parked* when idle. It
+> was not — the dispatcher busy-spun, costing ~13% of a core per idle runtime
+> and saturating an 8-core machine by K=64, which capped the very pattern
+> recommended here at roughly the core count. 0.2.0 makes the dispatcher park,
+> measured at 0.0% idle CPU and flat ~9.8 µs per-call latency through K=64. The
+> recommendation below is unchanged; see
+> [the corrected thread-cost discussion](#where-the-security-boundary-belongs)
+> and `BENCHMARKS.md` for the numbers.
+
 ## Measurements
 
 Apple M2, 8 cores, 16 GB, macOS 25.5.0 arm64; Python 3.12; release build
@@ -161,7 +171,7 @@ Honestly assessed, this is the answer, and its costs are:
 | Cost | Size | Mitigation |
 |---|---|---|
 | Memory per retained session | ~2.3–2.9 MB | K is bounded by LRU; 64 sessions ≈ 150–190 MB |
-| OS thread per retained session | 1 (each `Runtime` pins its own thread, `runner.rs:1945`+) | Same bound as above; this is the real scaling limit, not RAM |
+| OS thread per retained session | 1 (each `Runtime` pins its own thread, `runner.rs:1945`+) | Genuinely parked as of 0.2.0 (0.0% idle CPU at every K measured); same LRU bound as memory |
 | Cold-start penalty on a session's first call | 3.14 ms → 1.25 ms with a snapshot | Increment 3 below |
 | Cold-start penalty again after eviction | same | Tune TTL to session-idle reality; a miss is 3.14 ms, not an error |
 | Cross-session leakage risk | **none by construction** | Never share a `Runtime` across session ids |
@@ -173,6 +183,33 @@ for pooled isolates, for the same `!Send` reason). K=64 retained sessions
 means 64 parked threads. That is fine; K=10,000 is not. Any host expecting
 very high session counts with very sparse activity should pick a small K and
 accept cold starts on miss, which is precisely what an LRU gives.
+
+**This paragraph was wrong when first written, in the way that mattered most,
+and the correction is the reason peno 0.2.0 exists.** It asserted 64 *parked*
+threads. They were not parked. `RuntimeDispatcher::run` selected between
+`cmd_rx.recv()` and `tokio::task::yield_now()`, and because `yield_now` is
+always immediately ready the loop never blocked — so each retained `Runtime`
+burned CPU continuously for its entire lifetime whether or not it had work.
+Measured on the same 8-core machine as everything else here: **12.9% of a core
+per idle runtime, 169.9% at K=8, and 684% — the machine saturated — by K=64.**
+Worse, per-call latency degraded ~2.3x (14.5 µs → 29.5-35 µs) once the spinning
+threads outnumbered the cores, so the session-affinity recommendation this
+document makes was in practice capped at roughly *cores-minus-one* concurrent
+sessions, not by memory or by thread count at all.
+
+**Fixed in 0.2.0.** The dispatcher now parks on `cmd_rx.recv()` when the event
+loop is drained and no job is queued or active, and while async work *is* in
+flight it waits on a real waker (`deno_core` signals it on op/promise progress,
+replacing a `noop_waker` that discarded every wake) bounded by the active job's
+exact deadline. Re-measured: **0.0% idle CPU at K = 1, 4, 8, 16, 32 and 64, and
+per-call latency flat at ~9.8 µs across that whole range** — faster even at
+K=1, since the spinning thread had been competing with the calling Python
+thread. Full before/after tables, including the async paths, are in
+`BENCHMARKS.md`; `tests/test_idle_cpu.py` is the permanent regression test.
+
+So the scaling ceiling for session affinity is now what this document always
+claimed it was — thread count and memory, bounded by an LRU — rather than the
+core count. The recommendation stands unchanged; it just actually works now.
 
 ## Can global-state reset ever be trusted?
 
@@ -437,9 +474,12 @@ Stated explicitly rather than buried, for the record.
   are a property of the host's session-arrival distribution, not of
   peno. The registry should make them explicit constructor arguments
   with no clever defaults.
-- **Thread count, not memory, is the scaling ceiling.** Reasoned, not
-  measured: no measurement was taken of where K parked threads starts to
-  hurt scheduling. Worth measuring before recommending a large K.
+- **Thread count, not memory, is the scaling ceiling.** Partly measured now.
+  The original busy-spin made the *core* count the real ceiling; 0.2.0 removed
+  that (0.0% idle CPU and flat per-call latency through K=64, see
+  `BENCHMARKS.md`), so K=64 retained runtimes is now demonstrably cheap. Where
+  K parked threads *does* start to hurt scheduling is still unmeasured — K=64
+  is the largest value tested, and nothing here justifies a K in the thousands.
 - **Concurrency within a session is out of scope.** This design assumes
   sequential tool calls within a session, which matches the measured
   `test_steady_state_*` shape. Two concurrent calls on one session's runtime
@@ -459,7 +499,9 @@ Stated explicitly rather than buried, for the record.
 ## Mechanisms this design relies on
 
 Every mechanism this design depends on ships in `peno` 0.1.0, so nothing here
-is blocked on future work:
+is blocked on future work (though 0.2.0 or later is strongly preferable — see
+the busy-spin correction above, which is what makes retaining many runtimes
+viable at all):
 
 - **Required:** `bind_function`/`register_op`, the two static ops
   (`ops.rs`), `SnapshotBuilder` (`snapshot.rs`), and
