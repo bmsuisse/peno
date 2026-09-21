@@ -743,7 +743,12 @@ impl JsFunction {
         }
     }
 
-    /// Explicit async invocation that always returns an awaitable.
+    /// Explicit async invocation that always returns a coroutine.
+    ///
+    /// The coroutine is accepted by `asyncio.create_task` and
+    /// `asyncio.gather`; through 0.2.x this returned a bare `asyncio.Future`,
+    /// which `create_task` refuses. The call itself still starts the work on
+    /// the runtime thread immediately -- awaiting only collects the result.
     #[pyo3(signature = (*args, timeout=None))]
     fn call_async<'py>(
         &self,

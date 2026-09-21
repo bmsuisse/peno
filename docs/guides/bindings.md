@@ -466,6 +466,12 @@ with Runtime() as runtime:
 shared vocabulary, but typed errors work for *any* Python exception class —
 you do not have to inherit from them.
 
+Only `ToolBudgetError` is raised by the library. `ToolNotFoundError` is there
+for *your* tools to raise when a lookup inside one of them misses; `peno`
+never raises it for an unknown tool *name*, because a name this bridge does
+not expose is not a property on the namespace object at all, so guest JS gets
+V8's own `TypeError: tools.nope is not a function`.
+
 ### `ToolBridge` requires `Runtime`, not `IsolatePool`
 
 `ToolBridge.attach()` takes a [`Runtime`][peno.Runtime]. Passing a

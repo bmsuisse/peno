@@ -532,6 +532,27 @@ def test_tool_error_hierarchy() -> None:
     assert issubclass(ToolError, Exception)
 
 
+def test_an_unexposed_tool_name_is_a_plain_js_type_error() -> None:
+    """Pins what actually happens, since the docs used to claim otherwise.
+
+    `ToolNotFoundError` documented itself as "raised when JS asks for a tool
+    the bridge does not expose", and nothing raised it -- there is no code path
+    that could. A name the bridge refused was never installed, so it is not a
+    property on the namespace and guest JS gets V8's own TypeError. That is the
+    right answer; this test is here so the docs and the behaviour cannot drift
+    apart again.
+    """
+    bridge = ToolBridge({"allowed": lambda: 1})
+    with Runtime() as rt:
+        bridge.attach(rt)
+        assert rt.eval("typeof tools.allowed") == "function"
+        assert rt.eval("typeof tools.nope") == "undefined"
+        caught = rt.eval(
+            "(() => { try { tools.nope(); } catch (e) { return e.name; } })()"
+        )
+        assert caught == "TypeError"
+
+
 def test_tools_mapping_is_copied_not_aliased() -> None:
     """Mutating the caller's dict afterwards must not change the bridge."""
     tools: dict[str, Any] = {"a": lambda: 1}
