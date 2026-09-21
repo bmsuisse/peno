@@ -52,7 +52,19 @@ pub struct RuntimeHandle {
     serialization_limits: SerializationLimits,
     /// Registry for Python async iterables exposed as JS streams.
     py_stream_registry: PyStreamRegistry,
+    /// Grace period before a blocked caller abandons an unresponsive runtime,
+    /// or `None` to wait forever (the default -- see `recv_result`).
+    force_kill_grace: Option<Duration>,
 }
+
+/// How often a blocked caller re-checks whether a termination has been
+/// requested while it waits for a result.
+///
+/// This is a *timed block* (`Receiver::recv_timeout`), not a spin: the thread
+/// sleeps between checks and costs nothing measurable, so this only bounds how
+/// promptly the escalation clock starts, not how much CPU waiting burns.
+/// It is deliberately much smaller than the grace period.
+const FORCE_KILL_POLL_SLICE: Duration = Duration::from_millis(5);
 
 /// Represents a property assignment when binding Python objects into the JS global namespace.
 #[derive(Debug)]
@@ -78,6 +90,7 @@ impl RuntimeHandle {
     /// Returns an error if the runtime thread fails to start or initialize.
     pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
         let serialization_limits = config.serialization_limits();
+        let force_kill_grace = config.force_kill_grace;
         let (tx, termination, inspector_info, py_stream_registry) = spawn_runtime_thread(config)?;
         let (metadata, connection) = inspector_info
             .map(|(meta, state)| (Some(meta), Some(state)))
@@ -105,6 +118,7 @@ impl RuntimeHandle {
             inspector_connection: connection,
             serialization_limits,
             py_stream_registry,
+            force_kill_grace,
         })
     }
 
@@ -122,6 +136,124 @@ impl RuntimeHandle {
         self.tx
             .as_ref()
             .ok_or_else(|| RuntimeError::internal("Runtime has been shut down"))
+    }
+
+    /// Block for a command's result, escalating to a force-kill if the runtime
+    /// stops answering after a termination has been requested.
+    ///
+    /// # Why this is not a plain `recv()`
+    ///
+    /// The polite kill path has two tiers, and both need the runtime *thread*
+    /// to be able to run:
+    ///
+    /// 1. V8's `terminate_execution()` unwinds JavaScript the moment the
+    ///    isolate next enters it -- this is what kills `while(true){}`
+    ///    (measured median 0.11ms).
+    /// 2. The dispatcher observing the termination flag between polls, which is
+    ///    what kills a runtime parked on a pending promise (measured median
+    ///    ~1.4-1.8ms, worst case 4.02ms) -- see the `2b.` block in
+    ///    `RuntimeDispatcher::run`.
+    ///
+    /// Neither can fire when the runtime thread is itself wedged inside a host
+    /// call that never returns -- a synchronous `bind_function` handler that
+    /// blocks forever, say. The dispatcher is down inside `eval_sync` -> V8 ->
+    /// the Python callback, so it never reaches the flag check, and V8 never
+    /// re-enters JS to notice the termination. Before this escalation existed
+    /// the caller simply blocked on `recv()` for the life of the process.
+    ///
+    /// # What this does
+    ///
+    /// With `force_kill_grace` set, waits in [`FORCE_KILL_POLL_SLICE`] slices
+    /// instead of one unbounded block. Each slice is a timed park, not a spin,
+    /// so waiting still costs no CPU. Once a termination *has* been requested
+    /// it starts a clock and gives the runtime `force_kill_grace` to
+    /// acknowledge it; if the grace expires the caller gives up, marks the
+    /// handle terminated and shut down, and returns
+    /// [`RuntimeError::ForceKilled`].
+    ///
+    /// # Why it is opt-in
+    ///
+    /// `recv_timeout` is measurably more expensive than `recv`, and this is the
+    /// hot path: every synchronous `eval`, bound-function call and op
+    /// registration waits here. Comparing the two arms in a single process
+    /// (interleaved, 7x2000 calls per arm, four repeats) slicing costs roughly
+    /// +2..6% on `eval('1+1')` and +9..13% on a bound-function call --
+    /// i.e. about 10% on the library's headline per-call number, paid by every
+    /// healthy call, to buy a bounded kill for the one case that needs it: a
+    /// runtime wedged in a host call that never returns.
+    ///
+    /// That is a bad default trade, so `force_kill_grace` defaults to `None`
+    /// and this reduces to a literal `rx.recv()` behind one `Option` branch --
+    /// the previous code path exactly, so the default cannot regress. Callers
+    /// running genuinely untrusted host callbacks can opt in and accept the
+    /// ~10%.
+    ///
+    /// Note this escalation is *only* needed for a wedged runtime **thread**.
+    /// The parked-promise gap that motivated this work is fixed by the
+    /// dispatcher's own flag check and needs nothing here, so `timeout=` and
+    /// `TerminationHandle::terminate()` are bounded on every shape either way.
+    ///
+    /// # What this does NOT do
+    ///
+    /// It does not reclaim the wedged thread, and it deliberately does not
+    /// silently swap a fresh isolate in behind the caller's handle. A V8
+    /// isolate cannot be dropped from another thread, so the wedged thread is
+    /// *abandoned*, not killed: it stays parked in its host call, holding its
+    /// isolate and heap, until that call returns -- at which point V8's latched
+    /// `terminate_execution()` unwinds the script and the thread exits on its
+    /// own. If the host call never returns, the thread leaks for the life of
+    /// the process. This is the same trade Deno's hosted sandbox makes, except
+    /// that it can reach for SIGKILL on the whole process and a library cannot.
+    ///
+    /// Recreating is therefore left to the caller: the `Runtime` that produced
+    /// a `ForceKilled` error is permanently dead, and a replacement costs a
+    /// normal runtime creation (~2.8ms cold, ~1.3ms from a snapshot). Bound
+    /// host functions, module state and accumulated globals do *not* carry
+    /// over, which is precisely why this is an explicit, observable error
+    /// rather than a transparent retry.
+    fn recv_result<T>(&self, rx: &mpsc::Receiver<T>, what: &str) -> RuntimeResult<T> {
+        let Some(grace) = self.force_kill_grace else {
+            // Default: the cheap path, byte-for-byte the previous behaviour.
+            return rx
+                .recv()
+                .map_err(|_| RuntimeError::internal(format!("Failed to receive {what} result")));
+        };
+
+        let mut termination_seen_at = None;
+
+        loop {
+            match rx.recv_timeout(FORCE_KILL_POLL_SLICE) {
+                Ok(value) => return Ok(value),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RuntimeError::internal(format!(
+                        "Failed to receive {what} result"
+                    )));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !self.termination.is_requested() {
+                        // Healthy runtime, still working. Just re-block.
+                        continue;
+                    }
+
+                    let started = *termination_seen_at.get_or_insert_with(std::time::Instant::now);
+                    if started.elapsed() < grace {
+                        continue;
+                    }
+
+                    log::warn!(
+                        "Runtime did not acknowledge termination within {grace:?}; abandoning \
+                         the runtime thread and failing {what} with ForceKilled"
+                    );
+                    self.termination.force_mark_terminated();
+                    *self.shutdown.lock().unwrap() = true;
+                    return Err(RuntimeError::force_killed(format!(
+                        "Runtime did not acknowledge termination within {grace:?} and was \
+                         force-killed during {what}; the runtime thread has been abandoned \
+                         and this Runtime is no longer usable -- create a new one"
+                    )));
+                }
+            }
+        }
     }
 
     /// Evaluate JavaScript code synchronously and return the result.
@@ -142,9 +274,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send eval command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive eval result"))?
+        self.recv_result(&result_rx, "eval")?
     }
 
     /// Evaluate JavaScript code asynchronously with optional timeout.
@@ -202,9 +332,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send register_op command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive op registration result"))?
+        self.recv_result(&result_rx, "op registration")?
     }
 
     /// Set a custom Python resolver for module specifier resolution.
@@ -224,9 +352,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send set_module_resolver command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive set_module_resolver result"))?
+        self.recv_result(&result_rx, "set_module_resolver")?
     }
 
     /// Set a custom Python loader for fetching module source code.
@@ -246,9 +372,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send set_module_loader command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive set_module_loader result"))?
+        self.recv_result(&result_rx, "set_module_loader")?
     }
 
     /// Register a static ES module with pre-defined source code.
@@ -269,9 +393,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send add_static_module command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive add_static_module result"))?
+        self.recv_result(&result_rx, "add_static_module")?
     }
 
     /// Bind a Python object to the JavaScript global namespace.
@@ -297,9 +419,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send bind_object command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive bind_object result"))?
+        self.recv_result(&result_rx, "bind_object")?
     }
 
     /// Evaluate an ES module synchronously and return its namespace object.
@@ -319,9 +439,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send eval_module command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive eval_module result"))?
+        self.recv_result(&result_rx, "eval_module")?
     }
 
     /// Evaluate an ES module asynchronously with optional timeout.
@@ -378,9 +496,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send call_function_sync command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive function call result"))?
+        self.recv_result(&result_rx, "function call")?
     }
 
     /// Call a JavaScript function asynchronously with optional timeout.
@@ -524,9 +640,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send stream_release command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive stream_release result"))??;
+        self.recv_result(&result_rx, "stream_release")??;
         self.untrack_js_stream_id(stream_id);
         Ok(())
     }
@@ -548,9 +662,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send stream_cancel command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive stream_cancel result"))??;
+        self.recv_result(&result_rx, "stream_cancel")??;
         self.untrack_js_stream_id(stream_id);
         Ok(())
     }
@@ -610,9 +722,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send get_stats command"))?;
 
-        result_rx
-            .recv()
-            .map_err(|_| RuntimeError::internal("Failed to receive stats result"))?
+        self.recv_result(&result_rx, "stats")?
     }
 
     /// Get the inspector connection state if inspector is enabled.
@@ -664,7 +774,23 @@ impl RuntimeHandle {
         self.termination.ensure_reason("Terminated by host request");
         let first_request = self.termination.request();
         if !first_request {
+            // Someone else is already terminating; wait for them to finish.
+            // Bounded by the same grace period -- an unbounded loop here would
+            // hang a second caller behind a wedged runtime thread just as
+            // surely as an unbounded `recv()` would.
+            let started = std::time::Instant::now();
             while !self.termination.is_terminated() {
+                if let Some(grace) = self.force_kill_grace {
+                    if started.elapsed() >= grace {
+                        self.termination.force_mark_terminated();
+                        *self.shutdown.lock().unwrap() = true;
+                        return Err(RuntimeError::force_killed(format!(
+                            "Runtime did not acknowledge an in-progress termination within \
+                             {grace:?} and was force-killed; the runtime thread has been \
+                             abandoned and this Runtime is no longer usable -- create a new one"
+                        )));
+                    }
+                }
                 thread::sleep(Duration::from_millis(1));
             }
             return Ok(());
@@ -679,16 +805,17 @@ impl RuntimeHandle {
 
         self.termination.terminate_execution();
 
-        match result_rx.recv() {
+        // Bounded like every other wait: `request()` above has already flipped
+        // the flag, so `recv_result` starts its grace clock immediately and this
+        // cannot block forever against a wedged runtime thread.
+        match self.recv_result(&result_rx, "terminate confirmation") {
             Ok(result) => {
                 if result.is_ok() {
                     *self.shutdown.lock().unwrap() = true;
                 }
                 result
             }
-            Err(_) => Err(RuntimeError::internal(
-                "Failed to receive terminate confirmation",
-            )),
+            Err(err) => Err(err),
         }
     }
 

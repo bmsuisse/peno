@@ -178,6 +178,69 @@ When JavaScript code exceeds the configured heap limit, the runtime terminates a
 !!! warning "Set memory limits for untrusted code"
     Always configure `max_heap_size` when running untrusted JavaScript to prevent memory exhaustion attacks. The runtime will terminate gracefully when the limit is reached.
 
+## Stopping Stuck Code
+
+Any script can be stopped, including ones that never return to JavaScript.
+There are three mechanisms, in increasing order of severity:
+
+| Mechanism | Stops | Typical latency | Runtime afterwards |
+|---|---|---|---|
+| `timeout=` / `RuntimeConfig(timeout=)` | runaway loops, pending promises | the timeout | **still usable** |
+| `TerminationHandle.terminate()` | the same, from another thread | 0.12 ms (loops), ~1.7 ms (pending promises) | terminated, not reusable |
+| `RuntimeConfig(force_kill_grace=)` | a runtime wedged in a host callback | grace period | abandoned; create a new one |
+
+**A timeout never costs you your runtime.** Bound host functions, module state
+and globals all survive, so a `Runtime` you have configured and bound
+functions into remains valid after a script of yours is killed:
+
+```python
+with Runtime(RuntimeConfig(timeout=0.2)) as runtime:
+    runtime.bind_function("greet", lambda: "hello")
+    try:
+        runtime.eval("while(true){}")
+    except RuntimeError:
+        pass
+    runtime.eval("greet()")  # still "hello" -- the binding is intact
+```
+
+`terminate()` is for a script you want gone *now*, from a watchdog thread,
+and it does end the runtime: subsequent calls raise
+[`RuntimeTerminated`][peno.RuntimeTerminated]. It works on every parked
+shape — a promise nobody resolves, an `await` on one, a `.then` chain built
+on one — because the runtime's dispatcher checks for a termination request
+between event-loop polls. V8's own `terminate_execution()` cannot do this
+alone: it only fires when V8 next *enters* JavaScript, which a
+drained-but-pending event loop never does.
+
+### When the runtime thread itself is stuck
+
+One case defeats both of the above: a **synchronous host callback that never
+returns**. The runtime thread is then blocked inside your Python code, so it
+cannot notice a termination request and V8 cannot unwind anything.
+
+```python
+config = RuntimeConfig(force_kill_grace=peno.SUGGESTED_FORCE_KILL_GRACE)
+with Runtime(config) as runtime:
+    ...
+```
+
+With `force_kill_grace` set, a blocked caller waits that long for the runtime
+to acknowledge a termination and then gives up, raising
+[`RuntimeForceKilled`][peno.RuntimeForceKilled] (a subclass of
+`RuntimeTerminated`, so existing handlers keep working).
+
+!!! warning "`force_kill_grace` is opt-in for two real reasons"
+    **It costs ~10% per synchronous call**, because every blocking wait becomes
+    a sliced wait. Leave it unset unless you actually run untrusted *Python*
+    callbacks — runaway JavaScript and never-resolving promises are already
+    bounded without it.
+
+    **It abandons rather than reclaims.** A V8 isolate cannot be dropped from
+    another thread, so the wedged thread keeps its isolate and heap until the
+    host call returns (if ever). The `Runtime` is permanently unusable and none
+    of its bound functions or state carry over — create a new one, at the usual
+    cost of a runtime creation.
+
 ## Error Handling
 
 JavaScript errors are exposed as [`JavaScriptError`][peno.JavaScriptError], which includes the JavaScript stack trace, making debugging easier:

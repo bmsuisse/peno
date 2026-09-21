@@ -35,6 +35,13 @@ fn _peno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let runtime_terminated_type = m.py().get_type::<runtime::python::RuntimeTerminated>();
     runtime_terminated_type.setattr("__module__", "peno")?;
     m.add("RuntimeTerminated", runtime_terminated_type)?;
+    let runtime_force_killed_type = m.py().get_type::<runtime::python::RuntimeForceKilled>();
+    runtime_force_killed_type.setattr("__module__", "peno")?;
+    m.add("RuntimeForceKilled", runtime_force_killed_type)?;
+    m.add(
+        "SUGGESTED_FORCE_KILL_GRACE",
+        runtime::config::SUGGESTED_FORCE_KILL_GRACE.as_secs_f64(),
+    )?;
     let undefined: Py<PyAny> = runtime::python::get_js_undefined(m.py())?.into();
     m.add("undefined", undefined)?;
     m.add_function(pyo3::wrap_pyfunction!(

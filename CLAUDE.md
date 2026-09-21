@@ -461,7 +461,7 @@ asyncio.run(main())
 
 2. **Op permission mismatches**: Ops requiring permissions will fail if runtime not granted those permissions via `RuntimeConfig`.
 
-3. **Infinite promises**: Using `eval_async` without timeout on never-resolving promises will hang. Always consider timeout for untrusted code.
+3. **Infinite promises**: Using `eval_async` without a timeout on a never-resolving promise blocks until something else kills it. Pass `timeout=` for untrusted code. Both escapes work on every parked shape as of 0.2.0: the job's deadline (`timeout=`) and `TerminationHandle.terminate()` from a watchdog thread, which the dispatcher now observes between polls (~1.7 ms). A runtime whose *thread* is wedged in a host callback that never returns is the one case neither reaches -- see `RuntimeConfig(force_kill_grace=...)`, which is opt-in because it costs ~10% per call.
 
 4. **Module resolution order**: Custom resolver is checked first, then static modules. Return `None` from resolver to fall back to static modules.
 
