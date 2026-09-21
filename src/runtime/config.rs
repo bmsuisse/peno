@@ -13,15 +13,19 @@ use std::time::Duration;
 /// Suggested grace period for [`RuntimeConfig::force_kill_grace`], for
 /// callers that want the escalation without picking a number themselves.
 ///
-/// Chosen from measured polite-kill latency on this branch: a `while(true){}`
-/// interrupted by `terminate_execution()` returns in a median 0.11ms, and the
-/// slowest polite tier -- a runtime parked on a pending promise, which the
-/// dispatcher notices on its next `PENDING_WORK_TICK` -- has a median of
-/// ~1.4-1.8ms, a p95 of ~2.7ms and a worst case of 4.02ms across repeated
-/// 30-sample runs. 100ms is ~25x that worst case, so a runtime that was going
-/// to die politely always gets to, with a wide margin for a loaded machine,
-/// while still converting an unbounded hang into a bounded one. See
-/// BENCHMARKS.md.
+/// Chosen from measured polite-kill latency: a `while(true){}` interrupted by
+/// `terminate_execution()` returns in a median ~0.2ms, and the slowest polite
+/// tier -- a runtime parked on a pending promise, which only the dispatcher's
+/// termination-flag check can end -- has a median of ~0.3-0.4ms and a worst
+/// case of ~1.6ms across repeated 20-sample runs. 100ms is ~60x that worst
+/// case, so a runtime that was going to die politely always gets to, with a
+/// wide margin for a loaded machine, while still converting an unbounded hang
+/// into a bounded one. See BENCHMARKS.md.
+///
+/// Since 0.2.1 `TerminationController::request` signals the dispatcher's waker
+/// directly, so that check is reached on the next loop iteration rather than
+/// on the next `PENDING_WORK_TICK`; before that it was tick-bound at
+/// ~1.4-1.9ms.
 ///
 /// Not a default: `force_kill_grace` is `None` unless asked for, because
 /// enabling it costs ~10% per call. See `RuntimeHandle::recv_result`.
