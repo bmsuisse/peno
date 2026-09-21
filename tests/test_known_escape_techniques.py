@@ -260,6 +260,130 @@ class TestOverpatch:
             )
 
 
+class TestAmbientOpRegistryForgedId:
+    """Reaching an unexposed host capability by guessing its integer id.
+
+    Source:      docs/stable-release-review.md, finding M5 (internal review of
+                 peno 0.2.0); same class as the "ambient authority" family
+                 described by the object-capability literature
+    Disclosed:   2026-09
+    Root cause:  Addressing a capability by a small, guessable, *ambient* name.
+                 peno's op ids were allocated sequentially from zero and
+                 dispatch resolved any registered id, so the binding a guest
+                 was actually given was decoration: `__host_op_sync__(0, ...)`
+                 reached a handler that had never been put in its scope. The
+                 class of mistake is "the reference is derivable", not the
+                 particular payload.
+    Relevance:   Directly applicable, and reproduced against 0.2.0: the review
+                 called a function that was never exposed and got its return
+                 value. It also made `ToolBridge`'s namespace and call budget
+                 incidental rather than load-bearing, since anything registered
+                 on the runtime was reachable without going through the shim.
+    Status:      mitigated -- op ids are now unguessable 53-bit capability
+                 tokens drawn from a CSPRNG, and dispatch is additionally gated
+                 on an allowlist that only a completed bind step populates
+                 (src/runtime/ops.rs).
+    """
+
+    def test_the_demonstrated_escape_by_guessing_an_op_id_now_fails(self) -> None:
+        """The review's exact payload: register a tool, then call id 0.
+
+        Against 0.2.0 this returned `'PWNED:via-forged-id'` and the host
+        handler recorded the call.
+        """
+        with _fresh_runtime() as rt:
+            seen: list[str] = []
+            rt.bind_function(
+                "__never_called_from_js",
+                lambda c: seen.append(c) or "PWNED:" + c,
+            )
+
+            with pytest.raises(JavaScriptError) as caught:
+                rt.eval("__host_op_sync__(0, 'via-forged-id')")
+
+            assert "Unknown host op" in str(caught.value)
+            assert seen == [], f"a forged op id reached the host: {seen!r}"
+
+    def test_sequentially_enumerating_op_ids_finds_nothing(self) -> None:
+        """The other half of the technique: sweep the low id space.
+
+        Every id a guest can plausibly try must be a miss, and every miss must
+        look identical, so the registry's size and contents stay unknowable.
+        """
+        with _fresh_runtime() as rt:
+            rt.bind_function("secretTool", lambda: "should-not-be-reachable")
+            rt.bind_function("otherTool", lambda: "also-not")
+
+            messages = rt.eval("""
+              const seen = new Set();
+              const hits = [];
+              for (let id = 0; id < 512; id++) {
+                try { __host_op_sync__(id); hits.push(id); }
+                catch (e) { seen.add(e.message); }
+              }
+              JSON.stringify({hits, messages: Array.from(seen)})
+            """)
+
+        import json
+
+        result = json.loads(messages)
+        assert result["hits"] == [], f"enumeration found live ops: {result['hits']}"
+        # One uniform message: nothing distinguishes "no such op" from
+        # "exists but not yours", so nothing is enumerable.
+        assert result["messages"] == ["Unknown host op"], result["messages"]
+
+    def test_a_tools_own_token_is_not_a_key_to_the_other_tools(self) -> None:
+        """Holding one capability must not yield another.
+
+        A guest can always extract the token of a function it was *given* (it
+        is in that closure's source). That must remain a capability for that
+        one op and nothing else -- so the token space has to be sparse, not
+        adjacent.
+        """
+        with _fresh_runtime() as rt:
+            rt.bind_function("granted", lambda: "granted-result")
+            secret_calls: list[int] = []
+            rt.bind_function("withheldTool", lambda: secret_calls.append(1) or "secret")
+
+            # Recover the granted token from the closure the host installed,
+            # then probe its neighbours -- the shape that worked when ids were
+            # sequential.
+            reachable = rt.eval("""
+              const m = granted.toString().match(/\\d{6,}/);
+              if (!m) { 'no-token-in-source' }
+              else {
+                const base = Number(m[0]);
+                const found = [];
+                for (let d = -4; d <= 4; d++) {
+                  if (d === 0) continue;
+                  try { found.push(__host_op_sync__(base + d)); } catch (e) {}
+                }
+                JSON.stringify(found)
+              }
+            """)
+
+        assert reachable in ("no-token-in-source", "[]"), reachable
+        assert secret_calls == []
+
+    def test_revoking_a_capability_makes_its_binding_inert(self) -> None:
+        """There is a revoke, and it revokes the capability rather than only
+        the name -- so a global the guest already captured stops working."""
+        with _fresh_runtime() as rt:
+            calls: list[int] = []
+            token = rt.bind_function("tool", lambda: calls.append(1) or "ok")
+            assert rt.eval("tool()") == "ok"
+            # The guest squirrels the function reference away before revocation.
+            rt.eval("globalThis.captured = tool")
+
+            assert rt.revoke_op(token) is True
+
+            with pytest.raises(JavaScriptError):
+                rt.eval("captured()")
+            assert calls == [1], f"a revoked op still ran: {calls!r}"
+            # Revoking twice is not an error condition, just a no-op.
+            assert rt.revoke_op(token) is False
+
+
 class TestErrorMessageDisclosure:
     """Host-path/internals disclosure through exception text.
 
@@ -267,13 +391,103 @@ class TestErrorMessageDisclosure:
                  finding from the 2026-09 audit that produced this file
     Disclosed:   n/a
     Root cause:  Errors crossing a sandbox boundary carrying host filesystem
-                 paths or internal source locations, which hands an attacker
-                 a map of the host for a follow-up exploit.
+                 paths, internal source locations, or the names of host-side
+                 implementation machinery -- each of which hands an attacker a
+                 map of the host for a follow-up exploit.
     Relevance:   JS exceptions surfaced to Python should carry JS-side stack
                  info (script name, line) and not Rust source paths or
-                 absolute host paths.
+                 absolute host paths. Symmetrically, errors surfaced *to guest
+                 JS* must not name peno's internals. Until 0.2.0 they did:
+                 `serde_v8 error: recursion limit exceeded` and
+                 `GlobalTaskLocals not found in OpState` were both observable
+                 from sandboxed code, and the tests here checked only for host
+                 *paths*, so they structurally could not fail on it.
     Status:      mitigated
     """
+
+    # Names of host-side machinery that must never appear in text a guest can
+    # read. Filesystem paths are one disclosure class; these are the other,
+    # and the one the original tests missed.
+    INTERNAL_MARKERS = (
+        "serde_v8",
+        "deno_core",
+        "JsErrorBox",
+        "OpState",
+        "PythonOpRegistry",
+        "PyStreamRegistry",
+        "GlobalTaskLocals",
+        "TaskLocals",
+        "SerializationLimits",
+        "src/runtime",
+        ".cargo",
+        "Traceback",
+        "site-packages",
+        "/Users/",
+        "/home/",
+    )
+
+    def _assert_no_internals(self, text: str, what: str) -> None:
+        for marker in self.INTERNAL_MARKERS:
+            assert marker not in text, f"{what} leaked {marker!r}: {text}"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            # serde_v8's own recursion limit, reached above the op body -- the
+            # exact string the review observed on both builds.
+            "let v=1; for (let i=0;i<600;i++) v={n:v}; sink(v)",
+            # Over the byte budget inbound.
+            "sink('x'.repeat(9000))",
+            # Over the depth budget inbound.
+            "let v=1; for (let i=0;i<40;i++) v={n:v}; sink(v)",
+            # A function argument, which is now refused rather than truncated.
+            "sink(() => 1)",
+            # Circular, which the bridge's own traversal refuses.
+            "const a={}; a.self=a; sink(a)",
+            # An op token that is not a live capability.
+            "__host_op_sync__(7)",
+        ],
+    )
+    def test_guest_visible_op_errors_do_not_name_peno_internals(
+        self, payload: str
+    ) -> None:
+        """Whatever refuses a host call, the guest must not learn *what*.
+
+        The byte budget here is generous enough that the *caught message*
+        itself round-trips back out as the eval result; a tighter one would
+        fail the call on the way out and hide what is under test.
+        """
+        config = RuntimeConfig(max_serialization_bytes=4096, max_serialization_depth=8)
+        with Runtime(config) as rt:
+            rt.bind_function("sink", lambda *a: "ok")
+            message = rt.eval(
+                f"try {{ {payload}; 'no-throw' }} catch (e) {{ String(e && e.message) }}"
+            )
+
+        self._assert_no_internals(str(message), f"op error for {payload!r}")
+
+    def test_an_unknown_op_id_error_names_nothing(self) -> None:
+        with _fresh_runtime() as rt:
+            rt.bind_function("aDistinctiveToolName", lambda: 1)
+            message = rt.eval(
+                "try { __host_op_sync__(12345, 1) } catch (e) { String(e.message) }"
+            )
+        assert message == "Unknown host op"
+        self._assert_no_internals(message, "unknown-op error")
+
+    def test_a_mode_mismatch_error_does_not_name_the_op(self) -> None:
+        async def a_withheld_async_tool() -> str:
+            return "x"
+
+        with _fresh_runtime() as rt:
+            token = rt.register_op(
+                "aWithheldAsyncToolName", a_withheld_async_tool, mode="async"
+            )
+            message = rt.eval(
+                f"try {{ __host_op_sync__({token}) }} catch (e) {{ String(e.message) }}"
+            )
+        assert "aWithheldAsyncToolName" not in message, message
+        self._assert_no_internals(message, "mode-mismatch error")
 
     def test_js_errors_do_not_leak_host_paths_or_rust_internals(self) -> None:
         with _fresh_runtime() as rt:

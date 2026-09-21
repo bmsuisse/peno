@@ -81,7 +81,11 @@ The core JavaScript execution engine built on `deno_core` and V8:
 - **RuntimeDispatcher** (`runner.rs`) - Multiplexes command processing with async job execution
 - **RuntimeCoreState** (`runner.rs`) - Owns the V8 isolate and runtime state
 - **RuntimeConfig** (`config.rs`) - Configuration options
-- **PythonOpRegistry** (`ops.rs`) - Host function registry for Python-JavaScript bridge
+- **PythonOpRegistry** (`ops.rs`) - Host function registry for the
+  Python-JavaScript bridge. Handlers are addressed by unguessable capability
+  tokens and dispatched only after a bind step exposed them, so guest JS can
+  invoke exactly the ops it was given and nothing else; see the module docs
+  for the reasoning.
 - **PythonModuleLoader** (`loader.rs`) - Module resolution and loading
 - **Context** (`context.rs`) - Isolated execution contexts
 

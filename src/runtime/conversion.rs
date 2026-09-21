@@ -1,6 +1,8 @@
 //! Conversion helpers between Python objects and JSValue/serde_json values.
 
-use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::js_value::{
+    byte_limit_message, depth_limit_message, JSValue, LimitTracker, SerializationLimits,
+};
 use crate::runtime::python::{runtime_error_to_py, PyStreamSource};
 use indexmap::IndexMap;
 use num_bigint::BigInt;
@@ -28,35 +30,111 @@ const BIGINT_VALUE_KEY: &str = "value";
 /// including NaN and ±Infinity without sentinel strings.
 ///
 /// For Function variants, a RuntimeHandle must be provided to create JsFunction proxies.
+///
+/// This entry point applies **no** depth or size limits, because its callers
+/// (the eval-result path) have already been metered while reading the value
+/// out of V8. Anything converting *guest-supplied* input -- i.e. op arguments
+/// -- must use [`js_value_to_python_tracked`] instead, so the configured
+/// limits actually bind inbound. See the module-level note on symmetry.
 pub(crate) fn js_value_to_python(
     py: Python<'_>,
     value: &JSValue,
     handle: Option<&super::handle::RuntimeHandle>,
 ) -> PyResult<Py<PyAny>> {
+    let mut unlimited = LimitTracker::new(usize::MAX, usize::MAX);
+    js_value_to_python_tracked(py, value, handle, &mut unlimited)
+}
+
+/// Convert a JSValue into a Python object against a caller-supplied
+/// [`LimitTracker`], so several conversions can share one *aggregate* budget.
+///
+/// This is the inbound (JS -> Python) mirror of
+/// [`python_to_js_value_tracked`]. Both halves of the boundary must meter, and
+/// both must meter *aggregately*:
+///
+/// - Until v0.2.0 the inbound path passed no tracker at all, so a guest could
+///   hand a host tool four 9 MB strings in one call -- 37.7 MB measured
+///   against a configured 10 MB cap -- and a 10-deep object against a
+///   configured depth of 3. The identical payload was correctly refused as an
+///   `eval` *result*, which made the limit bind only the trusted party.
+/// - A fresh tracker per argument would reintroduce the per-argument budget
+///   bug that `python_to_js_value_tracked` was written to fix, so the ops pass
+///   one tracker across the whole argument list.
+pub(crate) fn js_value_to_python_tracked(
+    py: Python<'_>,
+    value: &JSValue,
+    handle: Option<&super::handle::RuntimeHandle>,
+    tracker: &mut LimitTracker,
+) -> PyResult<Py<PyAny>> {
+    tracker.enter().map_err(runtime_error_to_py)?;
+    let result = js_value_to_python_inner(py, value, handle, tracker);
+    tracker.exit();
+    result
+}
+
+fn js_value_to_python_inner(
+    py: Python<'_>,
+    value: &JSValue,
+    handle: Option<&super::handle::RuntimeHandle>,
+    tracker: &mut LimitTracker,
+) -> PyResult<Py<PyAny>> {
+    let add_bytes = |bytes: usize, tracker: &mut LimitTracker| {
+        tracker.add_bytes(bytes).map_err(runtime_error_to_py)
+    };
+
     match value {
         JSValue::Undefined => super::python::get_js_undefined(py).map(Into::into),
-        JSValue::Null => Ok(py.None()),
-        JSValue::Bool(b) => Ok(PyBool::new(py, *b).to_owned().into_any().unbind()),
-        JSValue::Int(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
-        JSValue::BigInt(bigint) => Ok(bigint.clone().into_pyobject(py)?.into_any().unbind()),
-        JSValue::Float(f) => Ok(PyFloat::new(py, *f).into_any().unbind()),
-        JSValue::String(s) => Ok(PyString::new(py, s).into_any().unbind()),
-        JSValue::Bytes(bytes) => Ok(PyBytes::new(py, bytes).into_any().unbind()),
+        JSValue::Null => {
+            add_bytes(4, tracker)?;
+            Ok(py.None())
+        }
+        JSValue::Bool(b) => {
+            add_bytes(1, tracker)?;
+            Ok(PyBool::new(py, *b).to_owned().into_any().unbind())
+        }
+        JSValue::Int(i) => {
+            add_bytes(size_of::<i64>(), tracker)?;
+            Ok(PyInt::new(py, *i).into_any().unbind())
+        }
+        JSValue::BigInt(bigint) => {
+            let (_, magnitude) = bigint.to_bytes_le();
+            add_bytes(magnitude.len(), tracker)?;
+            Ok(bigint.clone().into_pyobject(py)?.into_any().unbind())
+        }
+        JSValue::Float(f) => {
+            add_bytes(size_of::<f64>(), tracker)?;
+            Ok(PyFloat::new(py, *f).into_any().unbind())
+        }
+        JSValue::String(s) => {
+            add_bytes(s.len(), tracker)?;
+            add_bytes(16, tracker)?;
+            Ok(PyString::new(py, s).into_any().unbind())
+        }
+        JSValue::Bytes(bytes) => {
+            add_bytes(bytes.len(), tracker)?;
+            Ok(PyBytes::new(py, bytes).into_any().unbind())
+        }
         JSValue::Array(items) => {
+            add_bytes(16, tracker)?;
+            add_bytes(items.len().saturating_mul(size_of::<usize>()), tracker)?;
             let list = PyList::empty(py);
             for item in items {
-                list.append(js_value_to_python(py, item, handle)?)?;
+                list.append(js_value_to_python_tracked(py, item, handle, tracker)?)?;
             }
             Ok(list.into_any().unbind())
         }
         JSValue::Set(items) => {
+            add_bytes(24, tracker)?;
+            add_bytes(items.len().saturating_mul(size_of::<usize>()), tracker)?;
             let py_set = PySet::empty(py)?;
             for item in items {
-                py_set.add(js_value_to_python(py, item, handle)?)?;
+                py_set.add(js_value_to_python_tracked(py, item, handle, tracker)?)?;
             }
             Ok(py_set.into_any().unbind())
         }
         JSValue::Object(map) => {
+            add_bytes(24, tracker)?;
+            add_bytes(map.len().saturating_mul(size_of::<usize>() * 2), tracker)?;
             if let Some(JSValue::String(tag)) = map.get(TYPE_TAG) {
                 match tag.as_str() {
                     UNDEFINED_TYPE => {
@@ -89,7 +167,8 @@ pub(crate) fn js_value_to_python(
                         if let Some(JSValue::Array(values)) = map.get(SET_VALUES_KEY) {
                             let py_set = PySet::empty(py)?;
                             for item in values {
-                                py_set.add(js_value_to_python(py, item, handle)?)?;
+                                py_set
+                                    .add(js_value_to_python_tracked(py, item, handle, tracker)?)?;
                             }
                             return Ok(py_set.into_any().unbind());
                         }
@@ -111,11 +190,14 @@ pub(crate) fn js_value_to_python(
             }
             let dict = PyDict::new(py);
             for (key, val) in map {
-                dict.set_item(key, js_value_to_python(py, val, handle)?)?;
+                add_bytes(key.len(), tracker)?;
+                add_bytes(8, tracker)?;
+                dict.set_item(key, js_value_to_python_tracked(py, val, handle, tracker)?)?;
             }
             Ok(dict.into_any().unbind())
         }
         JSValue::Date(epoch_ms) => {
+            add_bytes(16, tracker)?;
             let datetime = py.import("datetime")?;
             let datetime_cls = datetime.getattr("datetime")?;
             let timezone = datetime.getattr("timezone")?;
@@ -125,6 +207,7 @@ pub(crate) fn js_value_to_python(
             Ok(py_dt.into_any().unbind())
         }
         JSValue::Function { id } => {
+            add_bytes(8, tracker)?;
             // Create JsFunction proxy
             let handle = handle.ok_or_else(|| {
                 PyRuntimeError::new_err("RuntimeHandle required to convert JSValue::Function")
@@ -139,6 +222,7 @@ pub(crate) fn js_value_to_python(
             Ok(js_fn.into_any())
         }
         JSValue::JsStream { id } => {
+            add_bytes(8, tracker)?;
             let handle = handle.ok_or_else(|| {
                 PyRuntimeError::new_err("RuntimeHandle required to convert JSValue::JsStream")
             })?;
@@ -190,9 +274,8 @@ fn python_to_js_value_internal(
     limits: &SerializationLimits,
 ) -> PyResult<JSValue> {
     if depth > limits.max_depth {
-        return Err(PyRuntimeError::new_err(format!(
-            "Depth limit exceeded: {} > {}",
-            depth, limits.max_depth
+        return Err(PyRuntimeError::new_err(depth_limit_message(
+            limits.max_depth,
         )));
     }
 
@@ -368,10 +451,9 @@ fn python_to_js_value_internal(
         Ok(JSValue::Float(f))
     } else if let Ok(s) = obj.extract::<String>() {
         if s.len() > limits.max_bytes {
-            return Err(PyRuntimeError::new_err(format!(
-                "String size limit exceeded: {} > {}",
+            return Err(PyRuntimeError::new_err(byte_limit_message(
                 s.len(),
-                limits.max_bytes
+                limits.max_bytes,
             )));
         }
         add_bytes(s.len(), tracker)?;

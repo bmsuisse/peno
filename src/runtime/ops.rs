@@ -3,10 +3,47 @@
 //! This module exposes two ops (`op_peno_call_python_sync` and
 //! `op_peno_call_python_async`) that bridge JavaScript calls into Python
 //! handlers. Python handlers are registered dynamically at runtime and
-//! identified by an integer op id.
+//! addressed by a **capability token**.
+//!
+//! # The op boundary is a capability, not an ambient name
+//!
+//! Until v0.2.0 an op id was a small integer allocated sequentially from
+//! zero, and dispatch resolved any registered id. That made the registry an
+//! *ambient* capability: guest JS could call `__host_op_sync__(0, ...)` and
+//! reach a handler that had never been put in its scope, so `ToolBridge`'s
+//! namespacing was decorative and its call budget survived only because the
+//! budgeted shim happened to be the thing registered. Two `ToolBridge`es with
+//! different trust levels on one `Runtime` were one trust level.
+//!
+//! Two changes make the boundary real, and they are deliberately layered:
+//!
+//! 1. **Unguessable tokens.** [`PythonOpRegistry::register`] draws a token
+//!    uniformly at random from `1..2^53` (a CSPRNG via `uuid::Uuid::new_v4`;
+//!    `2^53` because the token crosses the ABI as a JS number and must be
+//!    exactly representable). Knowing the token *is* the capability. Guessing
+//!    one is ~2^53 work, and sequential enumeration -- the actual escape the
+//!    review demonstrated -- finds nothing.
+//! 2. **An explicit allowlist established at bind time.** Registering an op
+//!    does not make it callable; [`PythonOpRegistry::expose`] does, and the
+//!    bind paths call it only *after* the binding has actually been installed
+//!    in the guest's scope. So an op whose binding failed half-way, or one
+//!    registered for host-side use only, is not dispatchable at all.
+//!
+//! [`PythonOpRegistry::revoke`] reverses both, which is what makes
+//! `Runtime.revoke_op` (and `ToolBridge.detach`) a real revocation rather
+//! than a hidden global that still works.
+//!
+//! # Nothing that describes host internals crosses into guest JS
+//!
+//! Op ids resolve to handler *names* on the host side only. Guest-visible
+//! failures are name-free and, for anything that would describe a host data
+//! structure, a single opaque string ([`OPAQUE_INTERNAL_ERROR`]) with the
+//! detail logged host-side. `deno_core`'s own argument-deserialization errors
+//! (`serde_v8 error: ...`) are scrubbed in the bridge JS, which is the only
+//! chokepoint above them -- see `sanitizeHostError` in the bridge source.
 
-use crate::runtime::conversion::{js_value_to_python, python_to_js_value};
-use crate::runtime::js_value::{JSValue, SerializationLimits};
+use crate::runtime::conversion::{js_value_to_python_tracked, python_to_js_value};
+use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
 use crate::runtime::stream::PyStreamRegistry;
 use deno_core::ascii_str;
 use deno_core::op2;
@@ -17,8 +54,7 @@ use deno_error::JsErrorBox;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3_async_runtimes::TaskLocals;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Execution mode for Python op handlers.
@@ -32,12 +68,67 @@ pub enum PythonOpMode {
     Async,
 }
 
+/// An op capability token: an unguessable identifier for one registered
+/// Python handler.
+///
+/// It crosses the JS ABI as a plain number, so it is bounded by
+/// [`MAX_OP_TOKEN`] to stay exactly representable as an IEEE-754 double.
+pub type OpToken = u64;
+
+/// Largest value an [`OpToken`] may take: `2^53 - 1`, the last integer a JS
+/// number represents exactly.
+pub const MAX_OP_TOKEN: OpToken = (1 << 53) - 1;
+
+/// Draw a fresh capability token from a CSPRNG.
+///
+/// `uuid` v4 is already a dependency and is documented to use the OS entropy
+/// source, so this avoids adding `rand` for eight bytes.
+fn random_op_token() -> OpToken {
+    loop {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let raw = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+        let token = raw & MAX_OP_TOKEN;
+        // Zero is excluded so that a forged `__host_op_sync__(0, ...)` -- the
+        // escape the v0.2.0 review demonstrated -- can never be a live token.
+        if token != 0 {
+            return token;
+        }
+    }
+}
+
+/// Guest-facing message for any failure that would otherwise describe a host
+/// data structure by name (`OpState`, `PyStreamRegistry`, ...). The real
+/// cause is logged host-side; the guest cannot act on it either way.
+pub const OPAQUE_INTERNAL_ERROR: &str = "Host call failed: internal runtime error";
+
+/// Guest-facing message for a token that is not a live, exposed capability --
+/// unknown, never exposed, revoked, or malformed. Deliberately uniform, so it
+/// reveals neither the existence nor the name of anything.
+const UNKNOWN_OP_ERROR: &str = "Unknown host op";
+
+fn opaque_internal_error(detail: &str) -> JsErrorBox {
+    log::error!("peno internal op failure: {detail}");
+    JsErrorBox::type_error(OPAQUE_INTERNAL_ERROR)
+}
+
+fn unknown_op_error() -> JsErrorBox {
+    JsErrorBox::type_error(UNKNOWN_OP_ERROR)
+}
+
+/// Validate the raw number guest JS passed as an op token.
+fn token_from_js(raw: f64) -> Result<OpToken, JsErrorBox> {
+    if !raw.is_finite() || raw.fract() != 0.0 || raw < 1.0 || raw > MAX_OP_TOKEN as f64 {
+        return Err(unknown_op_error());
+    }
+    Ok(raw as OpToken)
+}
+
 /// Metadata for a registered Python op.
 ///
 /// Stores the handler callable and its execution mode for op invocations from JavaScript.
 pub struct PythonOpEntry {
-    /// Unique op identifier.
-    pub id: u32,
+    /// Unguessable capability token for this op.
+    pub id: OpToken,
     /// Human-readable op name.
     pub name: String,
     /// Sync or async execution mode.
@@ -63,8 +154,10 @@ impl Clone for PythonOpEntry {
 
 #[derive(Default)]
 struct PythonOpRegistryInner {
-    next_id: AtomicU32,
-    handlers: Mutex<HashMap<u32, PythonOpEntry>>,
+    handlers: Mutex<HashMap<OpToken, PythonOpEntry>>,
+    /// Tokens that a bind step has actually installed in the guest's scope.
+    /// Dispatch consults this, not `handlers`.
+    exposed: Mutex<HashSet<OpToken>>,
 }
 
 /// Thread-safe registry of Python operations.
@@ -81,42 +174,89 @@ impl PythonOpRegistry {
         Self::default()
     }
 
-    /// Register a Python callable as an op.
+    /// Register a Python callable as an op and return its capability token.
     ///
-    /// Returns a unique op ID that can be used to invoke the handler from JavaScript.
-    pub fn register(&self, name: String, mode: PythonOpMode, handler: Py<PyAny>) -> u32 {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let entry = PythonOpEntry {
-            id,
-            name,
-            mode,
-            handler,
-        };
+    /// The op is **not** callable from JavaScript yet: dispatch is gated on
+    /// [`Self::expose`], which the bind paths call once the binding is
+    /// actually installed in the guest's scope.
+    pub fn register(&self, name: String, mode: PythonOpMode, handler: Py<PyAny>) -> OpToken {
         let mut handlers = self.inner.handlers.lock().unwrap();
-        handlers.insert(id, entry);
+        let mut id = random_op_token();
+        while handlers.contains_key(&id) {
+            id = random_op_token();
+        }
+        handlers.insert(
+            id,
+            PythonOpEntry {
+                id,
+                name,
+                mode,
+                handler,
+            },
+        );
         id
     }
 
-    pub fn get(&self, id: u32) -> Option<PythonOpEntry> {
-        let handlers = self.inner.handlers.lock().unwrap();
-        handlers.get(&id).cloned()
+    /// Make a registered op dispatchable from JavaScript.
+    ///
+    /// Returns `false` if the token is not registered (or was revoked), in
+    /// which case nothing is exposed.
+    pub fn expose(&self, id: OpToken) -> bool {
+        if !self.inner.handlers.lock().unwrap().contains_key(&id) {
+            return false;
+        }
+        self.inner.exposed.lock().unwrap().insert(id);
+        true
+    }
+
+    /// Revoke a capability: drop the handler and its exposure.
+    ///
+    /// Returns `false` if the token was not registered. After this, guest JS
+    /// calling the token gets the same uniform "Unknown host op" it would get
+    /// for any other value, so a global left behind by `bind_function`
+    /// becomes inert rather than quietly still working.
+    pub fn revoke(&self, id: OpToken) -> bool {
+        self.inner.exposed.lock().unwrap().remove(&id);
+        self.inner.handlers.lock().unwrap().remove(&id).is_some()
+    }
+
+    /// Resolve a token to its handler, but only if a bind step exposed it.
+    pub fn get_exposed(&self, id: OpToken) -> Option<PythonOpEntry> {
+        if !self.inner.exposed.lock().unwrap().contains(&id) {
+            return None;
+        }
+        self.inner.handlers.lock().unwrap().get(&id).cloned()
     }
 }
 
-fn lookup_entry(
-    op_state: &mut OpState,
-    op_id: u32,
-) -> Result<(PythonOpRegistry, PythonOpEntry), JsErrorBox> {
+fn lookup_entry(op_state: &mut OpState, raw_token: f64) -> Result<PythonOpEntry, JsErrorBox> {
     let registry = op_state
         .try_borrow::<PythonOpRegistry>()
-        .ok_or_else(|| JsErrorBox::type_error("Python op registry is missing"))?
+        .ok_or_else(|| opaque_internal_error("PythonOpRegistry missing from OpState"))?
         .clone();
 
-    let entry = registry
-        .get(op_id)
-        .ok_or_else(|| JsErrorBox::type_error(format!("Unknown Python op id {}", op_id)))?;
+    // One uniform failure for "malformed", "unknown", "not exposed" and
+    // "revoked": distinguishing them would let a guest enumerate the
+    // registry, which is exactly what this design removes.
+    registry
+        .get_exposed(token_from_js(raw_token)?)
+        .ok_or_else(unknown_op_error)
+}
 
-    Ok((registry, entry))
+/// Convert one call's guest-supplied arguments to Python against a single
+/// shared budget.
+///
+/// One tracker for the whole list, not one per argument: `max_serialization_bytes`
+/// caps what a *call* transfers. See [`js_value_to_python_tracked`].
+fn convert_args(
+    py: Python<'_>,
+    args: &[JSValue],
+    limits: &SerializationLimits,
+) -> Result<Vec<Py<PyAny>>, JsErrorBox> {
+    let mut tracker = LimitTracker::new(limits.max_depth, limits.max_bytes);
+    args.iter()
+        .map(|arg| js_value_to_python_tracked(py, arg, None, &mut tracker).map_err(map_pyerr))
+        .collect()
 }
 
 /// Marker byte prefixed onto op error messages that carry a Python exception
@@ -161,26 +301,22 @@ fn map_pyerr(err: PyErr) -> JsErrorBox {
 #[serde]
 fn op_peno_call_python_sync(
     state: &mut OpState,
-    #[smi] op_id: u32,
+    op_id: f64,
     #[serde] args: Vec<JSValue>,
 ) -> Result<JSValue, JsErrorBox> {
-    let (_registry, entry) = lookup_entry(state, op_id)?;
+    let entry = lookup_entry(state, op_id)?;
     if entry.mode != PythonOpMode::Sync {
-        return Err(JsErrorBox::type_error(format!(
-            "Op {} is not synchronous",
-            entry.name
-        )));
+        // Name-free on purpose: `Op {name} is not synchronous` let a guest
+        // loop over ids and harvest the names of host tools it was never given.
+        return Err(JsErrorBox::type_error("Host op is not synchronous"));
     }
 
     let serialization_limits = *state
         .try_borrow::<SerializationLimits>()
-        .ok_or_else(|| JsErrorBox::type_error("Serialization limits not configured"))?;
+        .ok_or_else(|| opaque_internal_error("SerializationLimits missing from OpState"))?;
 
     Python::attach(|py| -> Result<JSValue, JsErrorBox> {
-        let py_args = args
-            .iter()
-            .map(|arg| js_value_to_python(py, arg, None).map_err(map_pyerr))
-            .collect::<Result<Vec<_>, _>>()?;
+        let py_args = convert_args(py, &args, &serialization_limits)?;
         let py_args_tuple = PyTuple::new(py, py_args).map_err(map_pyerr)?;
         let result = entry
             .handler
@@ -199,32 +335,27 @@ fn op_peno_call_python_sync(
 #[serde]
 fn op_peno_call_python_async(
     state: &mut OpState,
-    #[smi] op_id: u32,
+    op_id: f64,
     #[serde] args: Vec<JSValue>,
 ) -> Result<impl std::future::Future<Output = Result<JSValue, JsErrorBox>>, JsErrorBox> {
-    let (_registry, entry) = lookup_entry(state, op_id)?;
+    let entry = lookup_entry(state, op_id)?;
     if entry.mode != PythonOpMode::Async {
-        return Err(JsErrorBox::type_error(format!(
-            "Op {} is not asynchronous",
-            entry.name
-        )));
+        // Name-free: see the sync op.
+        return Err(JsErrorBox::type_error("Host op is not asynchronous"));
     }
 
     // Get global task locals from OpState
     let global_locals = state
         .try_borrow::<GlobalTaskLocals>()
-        .ok_or_else(|| JsErrorBox::type_error("GlobalTaskLocals not found in OpState"))?
+        .ok_or_else(|| opaque_internal_error("GlobalTaskLocals missing from OpState"))?
         .clone();
 
     let serialization_limits = *state
         .try_borrow::<SerializationLimits>()
-        .ok_or_else(|| JsErrorBox::type_error("Serialization limits not configured"))?;
+        .ok_or_else(|| opaque_internal_error("SerializationLimits missing from OpState"))?;
 
     let coroutine = Python::attach(|py| -> Result<Py<PyAny>, JsErrorBox> {
-        let py_args = args
-            .iter()
-            .map(|arg| js_value_to_python(py, arg, None).map_err(map_pyerr))
-            .collect::<Result<Vec<_>, _>>()?;
+        let py_args = convert_args(py, &args, &serialization_limits)?;
         let py_args_tuple = PyTuple::new(py, py_args).map_err(map_pyerr)?;
         let awaitable = entry
             .handler
@@ -245,7 +376,7 @@ fn op_peno_call_python_async(
     // This allows the Rust future to be suspended and resumed, enabling re-entrance
     let task_locals = global_locals
         .0
-        .ok_or_else(|| JsErrorBox::type_error("TaskLocals not available for async op"))?;
+        .ok_or_else(|| opaque_internal_error("TaskLocals not available for async op"))?;
 
     Ok(async move {
         // Convert the coroutine future using into_future_with_locals
@@ -254,7 +385,7 @@ fn op_peno_call_python_async(
             let bound_coroutine = coroutine.bind(py).clone();
             pyo3_async_runtimes::into_future_with_locals(&task_locals, bound_coroutine)
         })
-        .map_err(|err| JsErrorBox::type_error(format!("Python coroutine error: {}", err)))?;
+        .map_err(|err| opaque_internal_error(&format!("Python coroutine setup failed: {err}")))?;
 
         // This error *is* the exception the awaited Python tool raised, so it
         // goes through map_pyerr like the sync path -- wrapping it in a
@@ -276,7 +407,7 @@ fn op_peno_stream_pull_py(
 ) -> Result<impl std::future::Future<Output = Result<JSValue, JsErrorBox>>, JsErrorBox> {
     let registry = state
         .try_borrow::<PyStreamRegistry>()
-        .ok_or_else(|| JsErrorBox::type_error("PyStreamRegistry is missing"))?
+        .ok_or_else(|| opaque_internal_error("PyStreamRegistry missing from OpState"))?
         .clone();
 
     Ok(async move {
@@ -295,7 +426,7 @@ fn op_peno_stream_cancel_py(
 ) -> Result<impl std::future::Future<Output = Result<(), JsErrorBox>>, JsErrorBox> {
     let registry = state
         .try_borrow::<PyStreamRegistry>()
-        .ok_or_else(|| JsErrorBox::type_error("PyStreamRegistry is missing"))?
+        .ok_or_else(|| opaque_internal_error("PyStreamRegistry missing from OpState"))?
         .clone();
 
     Ok(async move {
@@ -335,7 +466,47 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     });
   }
 
-  function prepare(value) {
+  // A JS function has no Python representation, and `serde_v8` turns one
+  // into an object with no own enumerable properties -- so before v0.2.1 a
+  // callback argument reached the host tool as `{}`, bare or nested, with no
+  // error. Silent truncation at a trust boundary is the worst failure mode
+  // available: a tool expecting `onProgress` got an empty options object and
+  // failed somewhere unrelated, or worse, carried on.
+  //
+  // So refuse it here, where the argument path is still known, rather than
+  // registering the function and handing the tool a live `JsFunction`.
+  // Supporting it would need a documented answer for what a held reference
+  // means after the call that supplied it has returned (who owns it, when it
+  // is released, what it does once the runtime is torn down) -- that is a
+  // feature with a lifetime contract, not a bug fix, and `{}` is not the
+  // status quo worth preserving while it is designed.
+  function rejectFunction(path) {
+    throw new TypeError(
+      "Cannot pass a JavaScript function to a host tool (at " +
+        path +
+        "). Host tools receive data, not callables; call the tool with a " +
+        "plain value, or have the tool return a value the guest applies itself."
+    );
+  }
+
+  function prepare(value, path) {
+    const at = path === undefined ? "argument" : path;
+    if (typeof value === "function") {
+      rejectFunction(at);
+    }
+    // A Symbol has no Python representation either, and it must not be
+    // handed down to `serde_v8`: that panics ("unknown ValueType for
+    // v8::Value") inside the op, which aborts the *host process* -- guest JS
+    // must never be able to do that. Refuse it here, where a throw is just a
+    // catchable JS error.
+    if (typeof value === "symbol") {
+      throw new TypeError(
+        "Cannot pass a JavaScript Symbol to a host tool (at " +
+          at +
+          "). Symbols have no Python representation; pass its description as " +
+          "a string instead."
+      );
+    }
     if (value === undefined || value === null) {
       return value;
     }
@@ -343,7 +514,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       return value;
     }
     if (Array.isArray(value)) {
-      return value.map(prepare);
+      return value.map((entry, index) => prepare(entry, at + "[" + index + "]"));
     }
     if (value instanceof Date) {
       return { __peno_type: "Date", epoch_ms: value.valueOf() };
@@ -351,7 +522,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     if (value instanceof Set) {
       return {
         __peno_type: "Set",
-        values: Array.from(value, (entry) => prepare(entry)),
+        values: Array.from(value, (entry, index) =>
+          prepare(entry, at + ".<set item " + index + ">")
+        ),
       };
     }
     if (typeof value === "bigint") {
@@ -360,11 +533,15 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     if (typeof value === "object") {
       const result = {};
       for (const [key, val] of Object.entries(value)) {
-        setOwn(result, key, prepare(val));
+        setOwn(result, key, prepare(val, at + "." + key));
       }
       return result;
     }
     return value;
+  }
+
+  function prepareArgs(args) {
+    return args.map((value, index) => prepare(value, "args[" + index + "]"));
   }
 
   function reviveStreamChunk(entry) {
@@ -450,18 +627,56 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     return restored;
   }
 
+  // Internal-implementation strings must not cross into guest JS. peno's own
+  // messages are already name-free and opaque (see OPAQUE_INTERNAL_ERROR in
+  // ops.rs), but `deno_core` builds its own errors *above* the op body -- an
+  // argument list it cannot deserialize yields `serde_v8 error: recursion
+  // limit exceeded`, naming a dependency crate to sandboxed code. This shim
+  // is the only chokepoint above that, so the scrub happens here.
+  //
+  // These markers name host-side machinery and are useless to a guest, which
+  // cannot act on any of them. A host exception whose own message contains
+  // one is masked too, which is the intended trade.
+  const INTERNAL_MARKERS = [
+    "serde_v8",
+    "deno_core",
+    "JsErrorBox",
+    "OpState",
+    "PythonOpRegistry",
+    "PyStreamRegistry",
+    "GlobalTaskLocals",
+    "TaskLocals",
+    "SerializationLimits",
+  ];
+  const OPAQUE_INTERNAL = "Host call failed: internal runtime error";
+  function sanitizeHostError(err) {
+    if (!err || typeof err.message !== "string") {
+      return err;
+    }
+    for (const marker of INTERNAL_MARKERS) {
+      if (err.message.indexOf(marker) !== -1) {
+        const opaque = new TypeError(OPAQUE_INTERNAL);
+        if (typeof Error.captureStackTrace === "function") {
+          Error.captureStackTrace(opaque, sanitizeHostError);
+        }
+        return opaque;
+      }
+    }
+    return err;
+  }
+
   globalThis.__penoCallSync = function (opId, ...args) {
-    const prepared = args.map(prepare);
+    const prepared = prepareArgs(args);
     try {
       return revive(ops.op_peno_call_python_sync(opId, prepared));
     } catch (err) {
-      throw restoreHostError(err);
+      throw sanitizeHostError(restoreHostError(err));
     }
   };
   globalThis.__penoCallAsync = function (opId, ...args) {
-    const prepared = args.map(prepare);
+    const prepared = prepareArgs(args);
     return ops.op_peno_call_python_async(opId, prepared).then(revive, (err) => {
-      throw restoreHostError(err);
+      throw sanitizeHostError(restoreHostError(err));
     });
   };
   globalThis.__host_op_sync__ = globalThis.__penoCallSync;
@@ -571,7 +786,13 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   globalThis.__peno_from_py_stream = function (id) {
     return new ReadableStream({
       async pull(controller) {
-        const chunk = reviveStreamChunk(await ops.op_peno_stream_pull_py(id));
+        let raw;
+        try {
+          raw = await ops.op_peno_stream_pull_py(id);
+        } catch (err) {
+          throw sanitizeHostError(restoreHostError(err));
+        }
+        const chunk = reviveStreamChunk(raw);
         if (chunk.done) {
           controller.close();
           return;

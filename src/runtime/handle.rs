@@ -4,7 +4,7 @@ use crate::runtime::config::RuntimeConfig;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::inspector::{InspectorConnectionState, InspectorMetadata};
 use crate::runtime::js_value::{JSValue, SerializationLimits};
-use crate::runtime::ops::PythonOpMode;
+use crate::runtime::ops::{OpToken, PythonOpMode};
 use crate::runtime::runner::{
     spawn_runtime_thread, FunctionCallResult, RuntimeCommand, TerminationController,
 };
@@ -75,7 +75,7 @@ pub(crate) enum BoundObjectProperty {
     },
     Op {
         key: String,
-        op_id: u32,
+        op_id: OpToken,
         mode: PythonOpMode,
     },
 }
@@ -307,10 +307,12 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::internal("Failed to receive async eval result"))?
     }
 
-    /// Register a Python callable as an op callable from JavaScript.
+    /// Register a Python callable as an op and return its capability token.
     ///
-    /// The `mode` specifies whether the handler is sync or async. Returns an op ID
-    /// that can be used to bind the op to JavaScript.
+    /// The `mode` specifies whether the handler is sync or async. The op is
+    /// **not** callable from JavaScript until [`Self::set_op_exposure`] blesses
+    /// the token -- see the `ops` module docs for why exposure is a separate
+    /// step from registration.
     ///
     /// # Errors
     /// Returns an error if the runtime is shut down or registration fails.
@@ -319,7 +321,7 @@ impl RuntimeHandle {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
-    ) -> RuntimeResult<u32> {
+    ) -> RuntimeResult<OpToken> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -333,6 +335,35 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::internal("Failed to send register_op command"))?;
 
         self.recv_result(&result_rx, "op registration")?
+    }
+
+    /// Expose or revoke an op capability.
+    ///
+    /// `exposed = true` makes a registered token dispatchable from guest JS;
+    /// the bind paths call it *after* the binding is installed, so a binding
+    /// that failed half-way leaves nothing callable. `exposed = false` revokes
+    /// the capability outright: the handler is dropped and any global left
+    /// behind by `bind_function` becomes inert.
+    ///
+    /// Returns `false` if the token was not registered on this runtime.
+    ///
+    /// # Errors
+    /// Returns an error if the runtime is shut down or the command fails.
+    pub fn set_op_exposure(&self, op_id: OpToken, exposed: bool) -> RuntimeResult<bool> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::SetPythonOpExposure {
+                op_id,
+                exposed,
+                responder: result_tx,
+            })
+            .map_err(|_| RuntimeError::internal("Failed to send op exposure command"))?;
+
+        result_rx
+            .recv()
+            .map_err(|_| RuntimeError::internal("Failed to receive op exposure result"))?
     }
 
     /// Set a custom Python resolver for module specifier resolution.

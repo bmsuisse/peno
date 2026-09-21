@@ -383,12 +383,9 @@ impl LimitTracker {
     ///
     /// Returns an error if the depth limit is exceeded.
     pub fn enter(&mut self) -> RuntimeResult<()> {
-        self.current_depth += 1;
+        self.current_depth = self.current_depth.saturating_add(1);
         if self.current_depth > self.max_depth {
-            return Err(RuntimeError::internal(format!(
-                "Depth exceeded maximum limit of {}",
-                self.max_depth
-            )));
+            return Err(RuntimeError::internal(depth_limit_message(self.max_depth)));
         }
         Ok(())
     }
@@ -402,15 +399,41 @@ impl LimitTracker {
     ///
     /// Returns an error if the size limit is exceeded.
     pub fn add_bytes(&mut self, bytes: usize) -> RuntimeResult<()> {
-        self.current_bytes += bytes;
+        // Saturating: an "unlimited" tracker (`usize::MAX`) plus a large
+        // payload would otherwise overflow and panic in a debug build.
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
         if self.current_bytes > self.max_bytes {
-            return Err(RuntimeError::internal(format!(
-                "Size ({} bytes) exceeded maximum limit of {} bytes",
-                self.current_bytes, self.max_bytes
+            return Err(RuntimeError::internal(byte_limit_message(
+                self.current_bytes,
+                self.max_bytes,
             )));
         }
         Ok(())
     }
+}
+
+/// The user-facing message for a depth rejection.
+///
+/// It names `max_serialization_depth` on purpose: the review of v0.2.0 found
+/// that a bare "Depth exceeded maximum limit of 100" gives the reader no way
+/// to discover that the limit is a knob they own, so a tunable limit reads as
+/// a hard wall. Every depth rejection on either direction of the boundary
+/// goes through here.
+pub fn depth_limit_message(max_depth: usize) -> String {
+    format!(
+        "Serialization depth exceeded the configured limit of {max_depth} \
+         (RuntimeConfig(max_serialization_depth=...))"
+    )
+}
+
+/// The user-facing message for a byte rejection. Names
+/// `max_serialization_bytes` for the same reason as [`depth_limit_message`].
+pub fn byte_limit_message(current_bytes: usize, max_bytes: usize) -> String {
+    format!(
+        "Serialization size ({current_bytes} bytes) exceeded the configured limit of \
+         {max_bytes} bytes (RuntimeConfig(max_serialization_bytes=...)); see \
+         docs/guides/advanced/arrow-ipc-dataframes.md for transferring large payloads"
+    )
 }
 
 #[cfg(test)]

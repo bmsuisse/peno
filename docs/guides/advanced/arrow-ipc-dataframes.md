@@ -39,13 +39,21 @@ table of `{id, name, value}` is only 5.4 MB of JSON text but is rejected
 outright:
 
 ```
-RuntimeError: Size (10485790 bytes) exceeded maximum limit of 10485760 bytes
+RuntimeError: Serialization size (10485790 bytes) exceeded the configured limit
+of 10485760 bytes (RuntimeConfig(max_serialization_bytes=...)); see
+docs/guides/advanced/arrow-ipc-dataframes.md for transferring large payloads
 ```
 
 The caller's only options are to raise the limit explicitly via
 `RuntimeConfig(max_serialization_bytes=...)` -- which also means accepting
 the memory cost in the table below -- or to move the bytes some other way.
 That failure, more than the speed, is why this recipe is worth writing down.
+
+The limit is symmetric: it caps what one call transfers in **either**
+direction, aggregated across all of a call's arguments, so a host tool
+receiving several large arguments from guest JS is bounded by the same
+number. (Through v0.2.0 it was enforced outbound only, which meant it
+inconvenienced the trusted side and did not constrain the untrusted one.)
 
 ## The recipe
 

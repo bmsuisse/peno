@@ -15,6 +15,7 @@ import pytest
 
 from peno import (
     IsolatePool,
+    JavaScriptError,
     Runtime,
     ToolBridge,
     ToolBudgetError,
@@ -423,6 +424,99 @@ class TestIsolatePoolIsAnApiWall:
         pool = IsolatePool(size=1)
         with pool.checkout() as isolate:
             assert isolate.eval("1 + 41") == 42
+
+
+class TestTheBridgeIsALoadBearingBoundary:
+    """The namespace and the budget must be more than decoration.
+
+    Through v0.2.0 op ids were sequential integers and dispatch resolved any
+    registered id, so a guest could call a bridge's underlying handler
+    directly by guessing -- bypassing another bridge's namespace entirely,
+    and surviving the budget only because the budgeted shim happened to be
+    the thing registered. Op ids are now unguessable capability tokens and
+    dispatch is gated on what a bind actually exposed.
+    """
+
+    def test_a_guest_cannot_reach_another_bridges_tools(self) -> None:
+        privileged_calls: list[int] = []
+        privileged = ToolBridge(
+            {"deleteEverything": lambda: privileged_calls.append(1) or "done"},
+            namespace="admin",
+        )
+        public = ToolBridge({"ping": lambda: "pong"}, namespace="tools")
+
+        with Runtime() as rt:
+            privileged.attach(rt)
+            public.attach(rt)
+
+            hits = rt.eval("""
+              const found = [];
+              for (let id = 0; id < 512; id++) {
+                try { found.push(__host_op_sync__(id)); } catch (e) {}
+              }
+              JSON.stringify(found)
+            """)
+
+        assert hits == "[]", f"low op ids reached host handlers: {hits}"
+        assert privileged_calls == []
+
+    def test_the_budget_cannot_be_bypassed_by_addressing_the_op_directly(
+        self,
+    ) -> None:
+        """The budget is charged in the shim, and the shim is all there is."""
+        bridge = ToolBridge({"ping": lambda: "pong"}, max_calls=2)
+        with Runtime() as rt:
+            bridge.attach(rt)
+            assert rt.eval("tools.ping()") == "pong"
+            assert rt.eval("tools.ping()") == "pong"
+            with pytest.raises(JavaScriptError):
+                rt.eval("tools.ping()")
+            # And the low-id sweep finds no unbudgeted way in.
+            assert (
+                rt.eval("""
+                  let reached = 0;
+                  for (let id = 0; id < 512; id++) {
+                    try { __host_op_sync__(id); reached++; } catch (e) {}
+                  }
+                  reached
+                """)
+                == 0
+            )
+        assert bridge.calls_made == 2
+
+    def test_detach_revokes_every_capability_the_bridge_installed(self) -> None:
+        calls: list[str] = []
+        bridge = ToolBridge(
+            {"a": lambda: calls.append("a") or 1, "b": lambda: calls.append("b") or 2},
+            namespace="tools",
+        )
+        with Runtime() as rt:
+            bridge.attach(rt)
+            assert rt.eval("tools.a()") == 1
+            rt.eval("globalThis.captured = tools.b")
+
+            assert bridge.detach(rt) == 2
+
+            with pytest.raises(JavaScriptError):
+                rt.eval("tools.a()")
+            # Even a reference captured before the revoke is inert.
+            with pytest.raises(JavaScriptError):
+                rt.eval("captured()")
+        assert calls == ["a"]
+
+    def test_detach_revokes_bare_globals_too(self) -> None:
+        bridge = ToolBridge({"ping": lambda: "pong"}, namespace=None)
+        with Runtime() as rt:
+            bridge.attach(rt)
+            assert rt.eval("ping()") == "pong"
+            assert bridge.detach(rt) == 1
+            with pytest.raises(JavaScriptError):
+                rt.eval("ping()")
+
+    def test_detach_on_a_never_attached_bridge_is_a_no_op(self) -> None:
+        bridge = ToolBridge({"ping": lambda: "pong"})
+        with Runtime() as rt:
+            assert bridge.detach(rt) == 0
 
 
 def test_repr_is_informative() -> None:

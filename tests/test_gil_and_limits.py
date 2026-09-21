@@ -109,7 +109,14 @@ class TestGilIsReleasedAcrossBlockingCalls:
 
 
 class TestSerializationBudgetIsAggregate:
-    """`max_serialization_bytes` caps a whole call, not each argument."""
+    """`max_serialization_bytes` caps a whole call, not each argument.
+
+    This class covers the **Python -> JS** direction (`JsFunction` arguments).
+    Its inbound mirror lives in
+    `TestSerializationLimitsAreSymmetric` below: covering only this half is
+    what let the v0.2.0 review find the identical bug, unfixed, on the
+    JS -> Python side.
+    """
 
     # Small enough to make the arithmetic obvious, large enough to clear the
     # per-value overhead the tracker also counts.
@@ -164,3 +171,85 @@ class TestSerializationBudgetIsAggregate:
         with Runtime() as rt:
             echo = rt.eval("(...args) => args.length")
             assert echo(shared, shared, shared) == 3
+
+
+class TestSerializationLimitsAreSymmetric:
+    """The inbound half: `max_serialization_bytes` / `max_serialization_depth`
+    must bind on **JS -> Python** too, aggregately, and identically.
+
+    Regression tests for the v0.2.0 review's finding M3. Both op entry points
+    (`src/runtime/ops.rs`) converted each guest argument with no
+    `LimitTracker` at all, so:
+
+    - 37.7 MB was accepted in one call against the default 10 MB cap
+      (four 9 MB strings; the guest picks the multiplier, so it scales
+      linearly), while a legitimate 11 MB *host* payload was refused. The
+      limit bound the trusted party and not the untrusted one.
+    - A 10-deep object was accepted against a configured depth of 3, while the
+      identical value was correctly refused as an `eval` result. What actually
+      stopped runaway inbound depth was `serde_v8`'s own recursion constant,
+      not the knob the user set.
+
+    `max_heap_size` does not cover any of this: the cost is host-side Python
+    and Rust allocation, outside the V8 heap.
+    """
+
+    LIMIT = 1 << 20  # 1 MiB, small enough to keep the test fast
+
+    def _runtime(self) -> Runtime:
+        return Runtime(RuntimeConfig(max_serialization_bytes=self.LIMIT, timeout=10.0))
+
+    def test_a_single_inbound_argument_over_the_limit_is_rejected(self) -> None:
+        with self._runtime() as rt:
+            rt.bind_function("sink", lambda *a: sum(len(x) for x in a))
+            with pytest.raises(Exception, match="(?i)size|byte|limit|exceed"):
+                rt.eval(f"sink('x'.repeat({self.LIMIT * 2}))")
+
+    def test_many_inbound_arguments_are_rejected_in_aggregate(self) -> None:
+        """The measured escape: four arguments each under the cap.
+
+        Against v0.2.0 this returned 37748736 with the default 10 MB limit.
+        """
+        each = (self.LIMIT * 3) // 4
+        with self._runtime() as rt:
+            rt.bind_function("sink", lambda *a: sum(len(x) for x in a))
+            # Each argument is fine on its own ...
+            assert rt.eval(f"sink('x'.repeat({each}))") == each
+            # ... and four of them are not.
+            with pytest.raises(Exception, match="(?i)size|byte|limit|exceed"):
+                rt.eval(f"sink(...Array(4).fill('x'.repeat({each})))")
+
+    def test_the_aggregate_check_does_not_reject_a_legitimate_inbound_call(
+        self,
+    ) -> None:
+        """Guard against over-correcting, as the outbound half does."""
+        each = self.LIMIT // 40
+        with self._runtime() as rt:
+            rt.bind_function("sink", lambda *a: len(a))
+            assert rt.eval(f"sink(...Array(5).fill('x'.repeat({each})))") == 5
+
+    def test_inbound_depth_respects_the_configured_limit(self) -> None:
+        """The review's exact repro: depth 10 against a configured 3."""
+        config = RuntimeConfig(max_serialization_depth=3)
+        with Runtime(config) as rt:
+            rt.bind_function("sink", lambda v: "ok")
+            with pytest.raises(Exception, match="(?i)depth"):
+                rt.eval("let a={};let c=a;for(let i=0;i<10;i++){c.n={};c=c.n};sink(a)")
+            # The same value as an `eval` result was always refused; the point
+            # of the fix is that the two now agree.
+            with pytest.raises(Exception, match="(?i)depth"):
+                rt.eval("let b={};let d=b;for(let i=0;i<10;i++){d.n={};d=d.n};b")
+            # And a shallow value still passes both ways.
+            assert rt.eval("sink({a: 1})") == "ok"
+
+    def test_both_limit_messages_name_the_knob_that_rejected_the_call(self) -> None:
+        """A tunable limit that does not name its knob reads as a hard wall."""
+        with self._runtime() as rt:
+            rt.bind_function("sink", lambda *a: 1)
+            with pytest.raises(Exception, match="max_serialization_bytes"):
+                rt.eval(f"sink('x'.repeat({self.LIMIT * 2}))")
+
+        with Runtime(RuntimeConfig(max_serialization_depth=3)) as rt:
+            rt.bind_function("sink", lambda v: 1)
+            with pytest.raises(Exception, match="max_serialization_depth"):
+                rt.eval("let a={};let c=a;for(let i=0;i<10;i++){c.n={};c=c.n};sink(a)")

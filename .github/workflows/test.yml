@@ -131,8 +131,15 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --tests -- -D warnings
 
+      # Pinned. `uv tool run ruff` resolves the newest release at job time, so
+      # an unpinned lint step turns every upstream ruff release into a red
+      # build that nobody in this repo caused: 0.16 widened the default rule
+      # selection and reports 248 findings (I001, PYI048, PIE790, SIM117, ...)
+      # against `main` @ 400e3cb, none of them regressions. Bumping the pin is
+      # then a deliberate commit that clears the new rules, which is what a
+      # lint gate is for.
       - name: ruff check
-        run: uv tool run ruff check python/peno tests scripts
+        run: uv tool run ruff@0.15.10 check python/peno tests scripts
 
       - name: ruff format
-        run: uv tool run ruff format --check python/peno tests scripts
+        run: uv tool run ruff@0.15.10 format --check python/peno tests scripts

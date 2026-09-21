@@ -584,7 +584,9 @@ class TestRuntimeConversions:
             identity = runtime.eval("(value) => value")
             payload = "abcdefghij" * 4  # 40 bytes
             with pytest.raises(
-                RuntimeError, match=r"String size limit exceeded: \d+ > \d+"
+                RuntimeError,
+                match=r"Serialization size \(\d+ bytes\) exceeded the configured "
+                r"limit of \d+ bytes \(RuntimeConfig\(max_serialization_bytes=\.\.\.\)\)",
             ):
                 identity(payload)
 
@@ -594,7 +596,9 @@ class TestRuntimeConversions:
             identity = runtime.eval("(value) => value")
             nested = [[1]]
             with pytest.raises(
-                RuntimeError, match=r"Depth exceeded maximum limit of \d+"
+                RuntimeError,
+                match=r"Serialization depth exceeded the configured limit of \d+ "
+                r"\(RuntimeConfig\(max_serialization_depth=\.\.\.\)\)",
             ):
                 identity(nested)
 
@@ -603,7 +607,8 @@ class TestRuntimeConversions:
         with Runtime(config) as runtime:
             with pytest.raises(
                 RuntimeError,
-                match=r"Size \(\d+ bytes\) exceeded maximum limit of \d+ bytes",
+                match=r"Serialization size \(\d+ bytes\) exceeded the configured "
+                r"limit of \d+ bytes \(RuntimeConfig\(max_serialization_bytes=\.\.\.\)\)",
             ):
                 runtime.eval("'x'.repeat(64)")
 
@@ -611,7 +616,9 @@ class TestRuntimeConversions:
         config = RuntimeConfig(max_serialization_depth=2)
         with Runtime(config) as runtime:
             with pytest.raises(
-                RuntimeError, match=r"Depth exceeded maximum limit of \d+"
+                RuntimeError,
+                match=r"Serialization depth exceeded the configured limit of \d+ "
+                r"\(RuntimeConfig\(max_serialization_depth=\.\.\.\)\)",
             ):
                 runtime.eval("({a: {b: {c: 1}}})")
 
@@ -1603,8 +1610,8 @@ class TestRuntimeOpsNativeTypes:
             return value
 
         with Runtime() as runtime:
-            runtime.register_op("echo", echo, mode="sync")
-            result = runtime.eval("__host_op_sync__(0, NaN)")
+            op_id = runtime.register_op("echo", echo, mode="sync")
+            result = runtime.eval(f"__host_op_sync__({op_id}, NaN)")
             assert math.isnan(result), f"Expected NaN but got {result}"
 
     def test_sync_op_echo_infinity(self):
@@ -1614,8 +1621,8 @@ class TestRuntimeOpsNativeTypes:
             return value
 
         with Runtime() as runtime:
-            runtime.register_op("echo", echo, mode="sync")
-            result = runtime.eval("__host_op_sync__(0, Infinity)")
+            op_id = runtime.register_op("echo", echo, mode="sync")
+            result = runtime.eval(f"__host_op_sync__({op_id}, Infinity)")
             assert result == float("inf"), f"Expected Infinity but got {result}"
 
     def test_sync_op_returns_nan_from_python(self):
@@ -1625,8 +1632,8 @@ class TestRuntimeOpsNativeTypes:
             return float("nan")
 
         with Runtime() as runtime:
-            runtime.register_op("returnNaN", return_nan, mode="sync")
-            result = runtime.eval("__host_op_sync__(0)")
+            op_id = runtime.register_op("returnNaN", return_nan, mode="sync")
+            result = runtime.eval(f"__host_op_sync__({op_id})")
             assert math.isnan(result), f"Expected NaN but got {result}"
 
     def test_sync_op_python_circular_list_raises_error(self):
@@ -1638,9 +1645,11 @@ class TestRuntimeOpsNativeTypes:
             return data
 
         with Runtime() as runtime:
-            runtime.register_op("makeCircularList", make_circular_list, mode="sync")
+            op_id = runtime.register_op(
+                "makeCircularList", make_circular_list, mode="sync"
+            )
             with pytest.raises(JavaScriptError) as exc_info:
-                runtime.eval("__host_op_sync__(0)")
+                runtime.eval(f"__host_op_sync__({op_id})")
             message = str(exc_info.value).lower()
             assert "circular" in message and "list" in message
 
@@ -1653,9 +1662,11 @@ class TestRuntimeOpsNativeTypes:
             return data
 
         with Runtime() as runtime:
-            runtime.register_op("makeCircularDict", make_circular_dict, mode="sync")
+            op_id = runtime.register_op(
+                "makeCircularDict", make_circular_dict, mode="sync"
+            )
             with pytest.raises(JavaScriptError) as exc_info:
-                runtime.eval("__host_op_sync__(0)")
+                runtime.eval(f"__host_op_sync__({op_id})")
             message = str(exc_info.value).lower()
             assert "circular" in message and "dict" in message
 
@@ -1667,9 +1678,9 @@ class TestRuntimeOpsNativeTypes:
             return ["x" * 2048 for _ in range(6000)]
 
         with Runtime() as runtime:
-            runtime.register_op("makeLargeList", make_large_list, mode="sync")
+            op_id = runtime.register_op("makeLargeList", make_large_list, mode="sync")
             with pytest.raises(JavaScriptError) as exc_info:
-                runtime.eval("__host_op_sync__(0)")
+                runtime.eval(f"__host_op_sync__({op_id})")
             message = str(exc_info.value).lower()
             assert "size" in message or "limit" in message
 
