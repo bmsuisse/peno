@@ -136,6 +136,42 @@ def test_a_deeply_nested_tool_argument_never_kills_the_host_process() -> None:
     assert "survived" in completed.stdout
 
 
+def test_a_zero_column_syntax_error_does_not_kill_the_runtime_thread() -> None:
+    """Pins the second thing the debug test suite found once it could run past
+    test 46.
+
+    `deno_core` 0.409.0 subtracts 1 from a V8-reported line number that can be
+    zero (`source_map.rs:105`), so an unterminated template literal panicked
+    the runtime thread in any build with overflow checks on -- turning a
+    catchable `JavaScriptError` into `RuntimeError: Failed to receive eval
+    result`. See the `[profile.dev.package."*"]` note in `Cargo.toml`.
+
+    Deterministic on purpose: the fuzz suite only finds this input by chance,
+    which would make the debug job flake red rather than fail honestly.
+    """
+    completed = _run_child(r"""
+        from peno import Runtime
+
+        with Runtime() as rt:
+            for source in ("`\\", "`${", "'"):
+                try:
+                    rt.eval(source)
+                except Exception as exc:  # noqa: BLE001
+                    message = str(exc)
+                    assert "Failed to receive eval result" not in message, (
+                        f"runtime thread died on {source!r}: {message}"
+                    )
+                    print(f"refused: {type(exc).__name__}")
+                else:
+                    raise AssertionError(f"{source!r} was accepted")
+            # The runtime must still be usable afterwards.
+            assert rt.eval("1 + 1") == 2
+        print("survived")
+    """)
+    _assert_child_survived(completed)
+    assert "survived" in completed.stdout
+
+
 def test_deeply_nested_literals_never_kill_a_pooled_isolate() -> None:
     """`IsolatePool` workers are a second thread family that runs V8 and the
     serializer, and they had the same missing `.stack_size()`."""

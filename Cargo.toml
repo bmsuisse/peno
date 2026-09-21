@@ -46,3 +46,28 @@ bench = ["pyo3/auto-initialize"]
 name = "runtime_benches"
 harness = false
 required-features = ["bench"]
+
+# Overflow checks stay ON for peno's own code -- they are worth having -- but
+# are turned off for third-party crates in unoptimized builds.
+#
+# `deno_core` 0.409.0 `source_map.rs:105` computes `line_number - 1` on a
+# u32 that it documents as 1-based, and V8 reports line/column 0 for some
+# syntax errors. So `rt.eval("`\\")` -- an unterminated template literal --
+# panics with "attempt to subtract with overflow" inside
+# `JsError::from_v8_exception`, killing the runtime thread and turning a
+# catchable `JavaScriptError` into `RuntimeError: Failed to receive eval
+# result`. peno cannot fix that arithmetic, and the release build users
+# actually get wraps instead of panicking, so a debug-only panic in a
+# dependency is not a bug this project can act on -- it just makes the debug
+# test suite unrunnable. Found by the new debug pytest job; pre-existing on
+# `main`, and previously hidden because the suite died before reaching the
+# fuzz test that generates that input.
+#
+# Scoped to `package."*"`, which in Cargo means dependencies and *not* the
+# local crate, so an overflow in peno's own arithmetic still panics loudly.
+# Remove both sections once `deno_core` is bumped past the fix.
+[profile.dev.package."*"]
+overflow-checks = false
+
+[profile.test.package."*"]
+overflow-checks = false
