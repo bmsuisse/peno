@@ -669,11 +669,7 @@ impl JsFunction {
         );
         let mut js_args = Vec::with_capacity(args.len());
         for arg in args.iter() {
-            js_args.push(python_to_js_value_tracked(
-                arg,
-                &mut tracker,
-                &self.serialization_limits,
-            )?);
+            js_args.push(python_to_js_value_tracked(arg, &mut tracker)?);
         }
         Ok(js_args)
     }

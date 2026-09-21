@@ -116,8 +116,6 @@ pub enum JSValue {
     PyStream { id: u32 },
 }
 
-impl JSValue {}
-
 // Manual Serialize implementation that errors on Function variant
 impl Serialize for JSValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -393,6 +391,13 @@ impl LimitTracker {
     /// Exit a depth level.
     pub fn exit(&mut self) {
         self.current_depth = self.current_depth.saturating_sub(1);
+    }
+
+    /// The configured byte ceiling, for the one caller that needs to reject a
+    /// single oversized value by its own size rather than by the running
+    /// total.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Add to the byte count.
