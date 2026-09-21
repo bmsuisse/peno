@@ -72,6 +72,16 @@ print(peno.eval("add(2, 3)"))  # 5
   V8's isolate handle, so a watchdog on a separate thread can interrupt
   execution safely. See [`PATCH.md`](PATCH.md) for the full root cause and
   proof; `tests/test_termination_handle.py` is the regression test.
+
+  As of 0.2.0 this works on *every* shape of stuck script, not just runaway
+  loops. `terminate()` used to be a no-op against a runtime parked on a
+  pending promise — V8 only acts on a termination when it next enters
+  JavaScript, and `new Promise(() => {})` never does, so it was unkillable.
+  The dispatcher now reads the termination flag between polls, killing all
+  such shapes in **~1.7 ms**, while `while(true){}` still dies the cheap way
+  at ~0.12 ms and a killed runtime keeps its bound functions. See
+  [`BENCHMARKS.md`](BENCHMARKS.md) and
+  [`tests/test_parked_termination.py`](tests/test_parked_termination.py).
 - **Context-isolated pooling, so speed doesn't cost you isolation.** A cold
   V8 isolate costs ~3 ms to create; `IsolatePool` keeps a small set of them
   warm and hands out a brand-new, empty V8 `Context` on every checkout — the

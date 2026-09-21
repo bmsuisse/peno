@@ -31,6 +31,15 @@ pub use stats::{InspectorEndpoints, RuntimeStats};
 
 create_exception!(crate::runtime::python, JavaScriptError, PyException);
 create_exception!(crate::runtime::python, RuntimeTerminated, PyRuntimeError);
+// Subclasses `RuntimeTerminated` deliberately: a force-kill *is* a
+// termination, so code that already catches `RuntimeTerminated` keeps working
+// unchanged. Callers that specifically care whether their runtime was
+// abandoned rather than shut down cleanly catch this narrower type.
+create_exception!(
+    crate::runtime::python,
+    RuntimeForceKilled,
+    RuntimeTerminated
+);
 
 #[pyfunction]
 pub fn _debug_active_runtime_threads() -> usize {

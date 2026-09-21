@@ -180,6 +180,83 @@ asserts an idle-CPU budget per runtime and that per-call latency at K = 3x the
 core count stays within 2x of its own K=1 baseline; all four cases fail against
 v0.1.0's dispatcher and pass against v0.2.0's.
 
+## Bounded termination for parked promises (v0.2.0)
+
+`TerminationHandle.terminate()` is the only kill switch callable from another
+thread. It flips a shared flag and calls V8's `terminate_execution()` -- and
+that second half does nothing to a runtime parked on a *pending promise*,
+because V8 only trips a termination when it next **enters** JavaScript and a
+drained-but-pending event loop never re-enters. Nothing in the dispatcher
+consulted the flag, so such a request was never observed: the caller blocked
+forever and the runtime could not be killed at all.
+
+The dispatcher now checks that flag between polls. It costs one atomic load per
+iteration and needs no new timer, because a runtime with a job in flight is
+already waking at least every `PENDING_WORK_TICK`.
+
+Kill latency, measured from `terminate()` being called to the blocked caller
+raising, 30 samples per shape:
+
+| Stuck script | before | after (med / p95) | worst seen |
+|---|---|---|---|
+| `while(true){}` (V8 unwind) | 0.09 ms | **0.11 / 0.16 ms** | 2.55 ms |
+| `new Promise(() => {})` | never | **1.71 / 2.71 ms** | 3.41 ms |
+| `await` on a parked promise | never | **1.59 / 2.66 ms** | 4.02 ms |
+| `.then` chain on a parked promise | never | **1.36 / 2.69 ms** | 2.84 ms |
+
+Medians and p95 are from one representative 30-sample run per shape; the
+"worst seen" column is the maximum observed across repeated runs, which is the
+figure the grace period below is sized against.
+
+The two tiers stay distinct, which is the point: `while(true){}` is still
+killed by V8 unwinding JS directly and does **not** pay for the dispatcher's
+poll interval. Nothing here turns a timeout into a runtime recreate -- a
+politely killed runtime keeps its bound host functions and globals, asserted by
+`test_polite_kill_does_not_recreate_the_runtime`.
+
+`timeout=` was already honest on all three parked shapes (the parking work's
+`RuntimeJob::deadline()` clamp) and is unchanged: 302 ms median for a 300 ms
+timeout on every shape. `test_terminate_beats_a_long_timeout` guards the
+difference -- with a 5 s timeout and a terminate at 100 ms, the termination path
+is what has to fire.
+
+### Escalation for a wedged runtime thread (`force_kill_grace`, opt-in)
+
+Neither polite tier can reach a runtime whose *thread* is wedged inside a host
+callback that never returns: the dispatcher is stuck below `eval_sync` in
+Python, so it never reaches the flag check, and V8 never re-enters JS.
+
+Setting `RuntimeConfig(force_kill_grace=...)` makes a blocked caller give up
+after that grace period, mark the runtime dead and raise `RuntimeForceKilled`
+(a subclass of `RuntimeTerminated`). Measured: a blocking sync host op with
+`terminate()` at 100 ms and a 150 ms grace releases the caller at ~250 ms,
+versus never.
+
+This is opt-in because it is not free. Comparing both arms in one process
+(interleaved, 7x2000 calls per arm, four repeats), slicing the blocking wait
+costs about **+2..6% on `eval('1+1')` and +9..13% on a bound-function call**.
+That is a bad trade to impose on every healthy call for a pathological case, so
+`force_kill_grace` defaults to `None`, where the wait is a literal `recv()` --
+the previous code path exactly. `peno.SUGGESTED_FORCE_KILL_GRACE` (0.1 s) is
+~25x the slowest polite kill observed above (4.02 ms), so a runtime that would
+have died politely always gets the chance to, with wide margin for a loaded
+machine.
+
+It also does not *reclaim* the wedged thread: a V8 isolate cannot be dropped
+from another thread, so the thread is abandoned, holding its isolate until the
+host call returns (if ever), at which point V8's latched termination unwinds it.
+Deno's hosted sandbox has the same limit and answers it with SIGKILL on the
+whole process, which a library cannot do. Recreating is left to the caller, at
+the normal cost of a new runtime (~2.8 ms cold, ~1.3 ms from a snapshot).
+
+`tests/test_parked_termination.py` is the permanent regression test: 15 cases
+covering all three parked shapes, both polite tiers, the escalation, and the
+"polite kill preserves state" guarantee. Five of them fail against the
+unmodified dispatcher. Every blocking call in that file runs on a joined daemon
+thread, so the old behaviour shows up as a readable failure in seconds instead
+of hanging the suite -- and nothing in it is `skipif`-gated, since the absence
+of exactly this test is what let the gap survive two releases.
+
 ## Known pre-existing environment flake (not caused by this pooling work)
 
 While re-running these benchmarks, `cargo bench --features bench` and the
