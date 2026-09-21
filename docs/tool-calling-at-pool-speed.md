@@ -57,6 +57,18 @@ problem were artifacts of measuring the wrong baseline.
 > [the corrected thread-cost discussion](#where-the-security-boundary-belongs)
 > and `BENCHMARKS.md` for the numbers.
 
+> **Update, peno 0.2.1.** Every tool-call figure in this document was measured
+> **without `timeout=`**, and through 0.2.0 that was the only configuration in
+> which they held: arming *any* deadline added a fixed ~13 ms, because the
+> timeout watchdog polled for its own cancellation behind a 10 ms sleep while
+> the runtime thread joined it. Since a production caller must arm a timeout —
+> it is the only kill switch for runaway guest code — the 13.4 µs below was
+> only ever reachable unsafely. 0.2.1 signals the cancel instead of polling
+> for it; the armed path is now ~1.2x the unarmed one, so these numbers now
+> describe the configuration you should actually deploy. The recommendation
+> below is unchanged; see
+> [Arming a timeout](../BENCHMARKS.md#arming-a-timeout-v021).
+
 ## Measurements
 
 Apple M2, 8 cores, 16 GB, macOS 25.5.0 arm64; Python 3.12; release build

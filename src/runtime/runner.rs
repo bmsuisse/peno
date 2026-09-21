@@ -510,13 +510,15 @@ pub enum RuntimeCommand {
 /// of a core and only applies for the bounded stretch during which async work
 /// is genuinely outstanding.
 ///
-/// It is also what bounds `TerminationHandle::terminate` against a runtime
-/// parked on a pending promise. `terminate_execution()` alone cannot help
-/// there -- it only trips when V8 next enters JavaScript, and a
-/// drained-but-pending event loop never does -- so the `2b.` block in `run`
-/// reads the termination flag directly instead, and this tick is what
-/// guarantees it is reached promptly (measured ~1.4-1.8ms median). Before that
-/// check existed such a runtime was unkillable.
+/// Nothing depends on it for termination any more. The `2b.` block in `run`
+/// reads the termination flag directly, because `terminate_execution()` cannot
+/// reach a runtime parked on a pending promise -- it only trips when V8 next
+/// enters JavaScript, and a drained-but-pending event loop never does. That
+/// check used to be reached only on this tick, which quietly made the tick
+/// load-bearing: raising it failed `tests/test_parked_termination.py` outright.
+/// `TerminationController::request` now signals the waker, so the check is
+/// reached on the next loop iteration (~0.3ms median, down from ~1.4-1.9ms)
+/// and this tick is free to be a backstop again.
 const PENDING_WORK_TICK: Duration = Duration::from_millis(1);
 
 /// Waker handed to `poll_event_loop`, replacing the `noop_waker` this
@@ -716,10 +718,12 @@ impl RuntimeDispatcher {
             // observed and the caller blocked on its result channel forever --
             // `new Promise(() => {})` was unkillable.
             //
-            // Checking the flag here closes that hole without any new timer:
-            // a runtime with a job in flight is already waking at least every
-            // `PENDING_WORK_TICK`, so this is observed within a tick (measured
-            // ~1ms; see BENCHMARKS.md) and costs one atomic load per iteration.
+            // Checking the flag here closes that hole without any new timer,
+            // and costs one atomic load per iteration. `request()` signals the
+            // dispatcher's waker, so this is reached on the very next iteration
+            // (~0.3ms median; see BENCHMARKS.md) rather than on the next
+            // `PENDING_WORK_TICK` -- which is what keeps the tick a backstop
+            // instead of the mechanism this depends on.
             //
             // This is the *polite* tier and deliberately does not recreate
             // anything: bound host functions, module state and the isolate are

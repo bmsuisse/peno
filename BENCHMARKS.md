@@ -194,6 +194,14 @@ The dispatcher now checks that flag between polls. It costs one atomic load per
 iteration and needs no new timer, because a runtime with a job in flight is
 already waking at least every `PENDING_WORK_TICK`.
 
+> **Update, v0.2.1.** Relying on the tick here made the tick *load-bearing*
+> rather than the backstop it was intended to be -- with the tick raised, these
+> tests failed outright. `TerminationController::request` now signals the
+> dispatcher's waker directly, so the flag check is reached on the next loop
+> iteration instead of on the next tick. The parked medians below improve from
+> ~1.4-1.9 ms to ~0.3-0.4 ms, and the suite passes with the tick raised to an
+> hour. See [Arming a timeout](#arming-a-timeout-v021).
+
 Kill latency, measured from `terminate()` being called to the blocked caller
 raising, 30 samples per shape:
 
@@ -278,6 +286,52 @@ running the unaffected benches individually
 which avoids the flake and still gives a real, reproducible before/after
 comparison. Investigating/fixing the underlying flake is separate follow-up
 work, tracked as a known issue rather than silently worked around.
+
+## Arming a timeout (v0.2.1)
+
+Every tool-calling figure in this file above -- including the headline 13.4 µs
+warm host call -- was measured **without `timeout=`**. That turned out to be
+the only configuration in which those numbers were reachable.
+
+Through v0.2.0, `SyncWatchdog` found out it had been cancelled by polling an
+`AtomicBool` from a `thread::sleep(10ms)` loop, while the runtime thread
+cancelled it and then *joined* it. The join therefore blocked for the
+remainder of the watchdog's current sleep chunk. Every call with a deadline
+armed paid a fixed ~13 ms (macOS overshoots a 10 ms sleep request) on top of
+its real work, and the cost did not depend on the deadline's value at all:
+
+| Host tool call | v0.2.0 | v0.2.1 |
+|---|---|---|
+| no deadline | 0.061 ms | 0.068 ms |
+| `timeout=0.5` | **13.48 ms** | **0.092 ms** |
+| `timeout=5` | **14.44 ms** | **0.083 ms** |
+| `timeout=300` | **14.07 ms** | **0.072 ms** |
+
+Medians of 60 samples on one warm runtime, release build. 0.5 s and 300 s
+costing the same is the signature: this was a fixed polling interval, not a
+deadline being approached.
+
+This mattered more than a microbenchmark usually does, because a production
+caller *must* arm a timeout -- it is the only kill switch for runaway guest
+code -- so the library's advertised fast path was unreachable in any safe
+configuration.
+
+v0.2.1 replaces the poll loop with a `Condvar`: the cancel is signalled and the
+join returns immediately. The armed path is now ~1.2x the unarmed one, the
+residual being the watchdog thread spawn and join, which is real work. The
+whole `pytest` suite also drops from ~118 s to ~54 s, since every timed test in
+it was paying the same toll.
+
+`PENDING_WORK_TICK` (1 ms) was **not** the cause and was never on this path;
+`DispatcherWaker` already covers op completion. With this fix plus the
+signalled termination request described above, the tick is finally the pure
+backstop it was documented as: raised to one hour, the full 548-test suite
+passes and host-call latency is unchanged.
+
+`tests/test_timeout_overhead.py` is the permanent regression test. It asserts
+the armed path's median stays within 15x the unarmed path's median, measured in
+the same process on the same warm runtime -- a ratio, because absolute timings
+are the part that moves between machines. Against v0.2.0 it fails at ~265x.
 
 ## Reproducing
 
