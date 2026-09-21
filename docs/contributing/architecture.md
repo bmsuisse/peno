@@ -274,10 +274,52 @@ sequenceDiagram
 
 **Key features**:
 
-- Permission-based (ops require specific permissions)
+- Capability-addressed: an op is reachable only by holding its token
 - Sync and async variants
 - JSON serialization for arguments and results
 - Automatic error propagation
+
+### There is no permission model, and none is missing
+
+Through 0.2.x this document, and `CLAUDE.md`, described ops as
+"permission-based (ops require specific permissions)" and claimed a runtime
+had to be "granted those permissions via `RuntimeConfig`". None of that
+existed: `grep -rni permission src/` returned zero hits and `RuntimeConfig`
+had no permission field. The v0.2.0 review called this the most load-bearing
+doc/code divergence in the repo, precisely because it is a *security* claim —
+a reader who believes ops are permission-gated will not look for what is
+actually gating them.
+
+What actually gates them, as of 0.2.1, is two layers that are stronger than
+a permission list would have been, because they are unforgeable rather than
+checked:
+
+1. **Unguessable capability tokens.** `PythonOpRegistry::register` draws an op
+   token uniformly from `1..2^53` via a CSPRNG. Holding the token *is* the
+   capability; there is no name to ask for and no list to consult. Before
+   this, op ids were sequential integers and `__host_op_sync__(0, ...)`
+   reached handlers the guest had never been given.
+2. **An allowlist established at bind time.** Registering an op does not make
+   it callable — `expose` does, and the bind paths call it only after the
+   binding is actually installed in the guest's scope. An op whose bind failed
+   half-way, or one registered for host-side use, is not dispatchable at all.
+   `revoke` reverses both, which is what makes `Runtime.revoke_op` and
+   `ToolBridge.detach` real revocations.
+
+Scoping on top of that is `ToolBridge`: a namespace, a total call budget
+enforced in the shim the token resolves to, and a construction-time name
+check. Two bridges on one `Runtime` are two capability sets, which was not
+true before the token work.
+
+What is deliberately *not* here: there is no ambient authority to gate in the
+first place. A `Runtime` ships no filesystem, no network, no process and no
+timer access — a guest can only reach what a host explicitly bound. A
+permission model is the right shape for a runtime that grants capabilities by
+default and then restricts them; this one grants nothing by default, so the
+useful question is "what did you bind?", not "what did you permit?". See
+`src/runtime/ops.rs`'s module header for the full rationale, and
+`tests/test_known_escape_techniques.py::TestOverpatch` for the tests that pin
+the absent surfaces as absent.
 
 ## Performance Considerations
 

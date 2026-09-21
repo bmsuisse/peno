@@ -19,7 +19,7 @@ env:
   # tests never needs a bump here, only deleting them does. This is the
   # assertion that makes a mass-skip fail the job -- see
   # `scripts/check_test_report.py` for the full rationale.
-  MIN_PYTHON_TESTS: "548"
+  MIN_PYTHON_TESTS: "558"
   # Skips are unverified tests, so the budget is zero. The suite has exactly
   # one conditional skip (`tests/test_idle_cpu.py`, skipped above 16 CPUs) and
   # GitHub's macOS runners are well under that, so zero is correct here. Every
@@ -42,6 +42,14 @@ jobs:
     # issue tracked separately. Moving these jobs to Linux is a follow-up, and
     # would want a `manylinux: 2_28` container -- the pinned `deno_core`'s V8
     # needs glibc >= 2.27.
+    #
+    # State this plainly, because it is the largest remaining hole in the
+    # verification story: `workflow.yaml` publishes `manylinux_2_28` wheels
+    # that **no CI job ever imports, let alone tests**. The wheel is built in
+    # maturin-action's container (which does link), so what is missing is not
+    # the build but a job that installs the built wheel and runs `pytest`
+    # against it. Until that exists, every Linux claim in this repo rests on
+    # the container producing a wheel, not on anything having run it.
     runs-on: macos-latest
     strategy:
       fail-fast: false

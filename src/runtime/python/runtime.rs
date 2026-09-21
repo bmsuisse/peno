@@ -669,11 +669,7 @@ impl JsFunction {
         );
         let mut js_args = Vec::with_capacity(args.len());
         for arg in args.iter() {
-            js_args.push(python_to_js_value_tracked(
-                arg,
-                &mut tracker,
-                &self.serialization_limits,
-            )?);
+            js_args.push(python_to_js_value_tracked(arg, &mut tracker)?);
         }
         Ok(js_args)
     }
@@ -747,7 +743,12 @@ impl JsFunction {
         }
     }
 
-    /// Explicit async invocation that always returns an awaitable.
+    /// Explicit async invocation that always returns a coroutine.
+    ///
+    /// The coroutine is accepted by `asyncio.create_task` and
+    /// `asyncio.gather`; through 0.2.x this returned a bare `asyncio.Future`,
+    /// which `create_task` refuses. The call itself still starts the work on
+    /// the runtime thread immediately -- awaiting only collects the result.
     #[pyo3(signature = (*args, timeout=None))]
     fn call_async<'py>(
         &self,

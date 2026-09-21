@@ -339,3 +339,40 @@ class TestGetDefaultRuntime:
         rt = await task
         await asyncio.sleep(0)
         assert rt.is_closed()
+
+
+class TestThereIsNoPermissionModel:
+    """A tripwire for the doc claim the v0.2.0 review found to be false.
+
+    `docs/contributing/architecture.md` and `CLAUDE.md` described ops as
+    "permission-based" and said a runtime had to be granted permissions "via
+    `RuntimeConfig`". No such concept existed anywhere in `src/`. That is a
+    security claim, so the fix was to document what actually gates ops --
+    unguessable capability tokens plus an expose-at-bind allowlist, scoped by
+    `ToolBridge` -- and to keep the false version from coming back.
+
+    If someone does implement a permission model, this test fails, and the
+    docs get updated in the same commit. That is the point of it.
+    """
+
+    def test_runtime_config_has_no_permission_knob(self) -> None:
+        config = peno.RuntimeConfig()
+        offenders = [
+            name
+            for name in dir(config)
+            if "permission" in name.lower() or "allow_" in name.lower()
+        ]
+        assert not offenders, (
+            f"RuntimeConfig grew permission-shaped fields {offenders}; the docs say "
+            "there is no permission model -- update "
+            "docs/contributing/architecture.md and CLAUDE.md in the same change."
+        )
+
+    def test_the_capability_token_is_what_gates_an_op(self) -> None:
+        """The real model, exercised: hold the token, call it; revoke it, don't."""
+        with peno.Runtime() as rt:
+            token = rt.bind_function("tool", lambda: "reached")
+            assert rt.eval("tool()") == "reached"
+            assert rt.revoke_op(token) is True
+            with pytest.raises(peno.JavaScriptError):
+                rt.eval("tool()")

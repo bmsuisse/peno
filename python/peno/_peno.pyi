@@ -4,7 +4,7 @@ Type stubs for the peno Python extension module.
 
 import types
 from datetime import timedelta
-from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterable, Awaitable, Callable, Coroutine, Mapping
 from typing import (
     Any,
     Self,
@@ -133,6 +133,12 @@ class RuntimeConfig:
             inspector: Optional inspector configuration enabling Chrome DevTools
             snapshot: Optional V8 startup snapshot bytes
             max_serialization_depth: Maximum nesting depth when transferring values
+                (default 100). Raising it past roughly 900 is unsafe if you then
+                pass a deep argument from a small-stack thread: the Python-to-JS
+                conversion recurses on the *calling* thread, and a
+                ``threading.Thread`` gets 512 KB on macOS, which peno cannot
+                change. The default has ~9x of headroom on such a thread; see
+                ``RUNTIME_THREAD_STACK_SIZE`` in ``src/runtime/js_value.rs``.
             max_serialization_bytes: Maximum serialized byte size when transferring values
             force_kill_grace: How long a blocked caller waits for the runtime to
                 acknowledge a termination before abandoning the runtime thread and
@@ -433,27 +439,35 @@ class JsFunction:
 
     def __call__(
         self, *args: Any, timeout: float | int | timedelta | None = ...
-    ) -> Any | Awaitable[Any]:
+    ) -> Any | Coroutine[Any, Any, Any]:
         """
         Invoke the JavaScript function with the provided arguments. If the JS
         function finishes synchronously, its return value is produced directly.
-        Otherwise, the result is awaitable and must be awaited.
+        Otherwise, the result is a coroutine and must be awaited.
 
         Args:
             *args: Arguments forwarded into JavaScript
             timeout: Optional timeout (seconds as float/int, or datetime.timedelta)
 
         Returns:
-            Either the JavaScript return value or an awaitable resolving to it.
+            Either the JavaScript return value or a coroutine resolving to it.
         """
         ...
 
     def call_async(
         self, *args: Any, timeout: float | int | timedelta | None = ...
-    ) -> Awaitable[Any]:
+    ) -> Coroutine[Any, Any, Any]:
         """
-        Always invoke the JavaScript function asynchronously, returning an awaitable
-        regardless of whether the underlying JS completes synchronously.
+        Always invoke the JavaScript function asynchronously, returning a
+        coroutine regardless of whether the underlying JS completes
+        synchronously.
+
+        The work starts on the runtime thread as soon as this is called, not on
+        first await. The return type is a coroutine rather than an
+        `asyncio.Future` so that `asyncio.create_task` accepts it -- running two
+        JS calls concurrently is the main reason to reach for this method, and
+        `create_task` on a bare Future raises
+        `TypeError: a coroutine was expected`. Changed in 0.3.0.
         """
         ...
 

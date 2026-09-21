@@ -310,6 +310,54 @@ def test_unresolved_then_resolved_promise_still_works() -> None:
     assert run_bounded(lambda: asyncio.run(amain())) == "resolved"
 
 
+def test_terminate_settles_a_pending_js_function_call_async() -> None:
+    """`JsFunction.call_async` is one of the surfaces the kill has to cover.
+
+    The v0.2.0 review recorded this separately from the `eval_async` shapes
+    above, because it is reached through a different job
+    (`CallFunctionAsync`/`ResumeFunctionCall`, not `EvalAsync`) and it was not
+    obvious from outside that the dispatcher fix covered it. It does -- the
+    flag check runs between polls regardless of which job is active, and
+    `cancel_all_jobs` answers whichever one it finds -- so this test exists to
+    keep that true rather than to report a gap.
+
+    A future that never settles is the failure mode: the caller would await
+    forever with no exception and no result.
+    """
+
+    async def amain() -> tuple[type | None, str, float]:
+        runtime = peno.Runtime()
+        handle = runtime.termination_handle()
+        js_func = runtime.eval("(() => new Promise(() => {}))")
+        pending = asyncio.ensure_future(js_func.call_async())
+        # Let the call reach the runtime thread and park before killing it.
+        await asyncio.sleep(0.05)
+        _terminate_after(handle, TERMINATE_AFTER_S)
+        started = time.monotonic()
+        caught: BaseException | None = None
+        try:
+            await asyncio.wait_for(pending, KILL_CEILING_S + 1.0)
+        except BaseException as exc:  # noqa: BLE001
+            caught = exc
+        elapsed = time.monotonic() - started
+        exc_type, message = classify(caught)
+        del runtime, js_func, caught
+        return exc_type, message, elapsed
+
+    exc_type, message, elapsed = run_bounded(lambda: asyncio.run(amain()))
+
+    assert exc_type is not None and not issubclass(exc_type, asyncio.TimeoutError), (
+        f"call_async never settled after terminate(): {exc_type} ({message})"
+    )
+    assert issubclass(exc_type, peno.RuntimeTerminated), (
+        f"expected RuntimeTerminated, got {exc_type} ({message})"
+    )
+    kill_latency = elapsed - TERMINATE_AFTER_S
+    assert kill_latency < KILL_CEILING_S, (
+        f"call_async took {kill_latency * 1000:.1f}ms to settle after terminate()"
+    )
+
+
 class TestForceKillEscalation:
     """The escalation tier, for a runtime whose *thread* is wedged.
 

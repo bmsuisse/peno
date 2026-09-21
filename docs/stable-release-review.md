@@ -3,6 +3,29 @@
 Review of `main` at `40eb47d` (v0.2.0, dispatcher-parking fix merged). Review
 only -- no source was changed by this pass.
 
+> **Status, 0.3.0.** Every finding below has now been actioned or answered.
+> M1-M6, T2 and the fuzz-strategy work landed in v0.2.1. The remainder landed
+> in 0.3.0: R1/R2/R3/R4 (the job state machines, `SnapshotSource`, the
+> duplicate depth counter, the empty impl), R5 (the three `PATCH*.md` files are
+> now `docs/contributing/upstream-divergence.md`), S1 (README framing), S3
+> (`call_async` returns a coroutine), T1 (the op-registry leak has a
+> regression test). Two findings were answered rather than implemented, with
+> reasons, and the docs now say so: **S4** -- `ToolNotFoundError` stays as
+> vocabulary for user tools and its docstring no longer claims `peno` raises
+> it, because an unexposed tool name correctly produces V8's own `TypeError`;
+> **S5** -- there is no permission model and none is missing, the real boundary
+> being capability tokens plus `ToolBridge` scoping (see
+> `docs/contributing/architecture.md`). S6 is corrected in `CLAUDE.md`.
+> **Line numbers in this document are as-reviewed and no longer match the
+> tree** -- notably R1's table, since `runner.rs` has been rewritten there.
+>
+> Still open, deliberately: **S2** (two error types for "the runtime is gone"
+> -- unifying them is a breaking change worth a considered pass, not a
+> drive-by), **S7** (the two missing SAFETY comments and the detached
+> `ArrayBuffer` `[suspect]`, which still wants a repro before anyone acts), and
+> **S8** (the byte-limit message now names the setting, but `RuntimeError` is
+> still the type).
+
 ## How to read the evidence labels
 
 Every finding carries one of three labels, because "I read it" and "I ran it

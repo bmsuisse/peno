@@ -1,5 +1,6 @@
 """Tests for JavaScript function calling from Python."""
 
+import asyncio
 import gc
 import inspect
 import weakref
@@ -193,3 +194,50 @@ def test_runtime_close_releases_outstanding_functions():
 
     assert ref_a() is None
     assert ref_b() is None
+
+
+@pytest.mark.asyncio
+async def test_call_async_is_a_coroutine_so_create_task_accepts_it():
+    """`asyncio.create_task` must accept what `call_async` returns.
+
+    It used to return a bare `asyncio.Future`, which `await` accepts and
+    `create_task` refuses with "a coroutine was expected" -- so the first
+    person who tried to put two JS calls in flight hit a TypeError on the line
+    they reached for first.
+    """
+    with Runtime() as rt:
+        js_func = rt.eval("async (x) => x + 10")
+        awaitable = js_func.call_async(5)
+        assert inspect.iscoroutine(awaitable)
+        assert await asyncio.create_task(awaitable) == 15
+
+
+@pytest.mark.asyncio
+async def test_two_calls_can_be_in_flight_concurrently():
+    """`gather` over several calls resolves each to its own result."""
+    with Runtime() as rt:
+        js_func = rt.eval("async (x) => x * 3")
+        results = await asyncio.gather(*(js_func.call_async(n) for n in range(4)))
+        assert results == [0, 3, 6, 9]
+
+
+@pytest.mark.asyncio
+async def test_a_pending_call_through_plain_invocation_is_also_a_coroutine():
+    """`__call__` on a still-pending promise goes through the same bridge."""
+    with Runtime() as rt:
+        rt.eval("globalThis.__resolvers = []")
+        js_func = rt.eval("() => new Promise((resolve) => __resolvers.push(resolve))")
+        awaitable = js_func()
+        assert inspect.iscoroutine(awaitable)
+        task = asyncio.create_task(awaitable)
+        rt.eval("__resolvers.shift()(7)")
+        assert await task == 7
+
+
+@pytest.mark.asyncio
+async def test_eval_async_is_a_coroutine_too():
+    """The same wart, and the same fix, on the `Runtime` entry point."""
+    with Runtime() as rt:
+        awaitable = rt.eval_async("Promise.resolve(1 + 1)")
+        assert inspect.iscoroutine(awaitable)
+        assert await asyncio.create_task(awaitable) == 2

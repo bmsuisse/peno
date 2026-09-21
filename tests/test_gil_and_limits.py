@@ -83,7 +83,7 @@ class TestGilIsReleasedAcrossBlockingCalls:
         solo, duo = _measure_overlap(make)
         overlap = (2 * solo) / duo
         assert overlap > self.MIN_OVERLAP, (
-            f"JsFunction.__call__ serialized across threads (the v0.2.2 bug): "
+            f"JsFunction.__call__ serialized across threads (the pre-0.3 bug): "
             f"solo={solo:.1f}ms 2-thread={duo:.1f}ms overlap={overlap:.2f}x"
         )
 

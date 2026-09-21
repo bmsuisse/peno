@@ -57,11 +57,35 @@ class ToolError(Exception):
 
 
 class ToolBudgetError(ToolError):
-    """Raised when a bridge's total call budget is exhausted."""
+    """Raised by the bridge when its total call budget is exhausted.
+
+    This is the one error in this module the library itself raises; the other
+    two are vocabulary for *your* tools to raise.
+    """
 
 
 class ToolNotFoundError(ToolError):
-    """Raised when JS asks for a tool the bridge does not expose."""
+    """For a tool to raise when the thing it was asked to look up is missing.
+
+    ``peno`` never raises this itself, and deliberately does not: a tool this
+    bridge does not expose is simply not a property on the namespace object, so
+    guest JS gets V8's own ``TypeError: tools.nope is not a function`` -- which
+    is both the correct JS semantics and a better error than a host exception
+    smuggled through the op boundary. Through 0.2.x this class claimed
+    otherwise ("Raised when JS asks for a tool the bridge does not expose"),
+    which described a behaviour that has never existed.
+
+    What it is good for is the inner miss, which is common enough to deserve a
+    shared name::
+
+        def read(key):
+            if key not in store:
+                raise ToolNotFoundError(f"no such key: {key}")
+            return store[key]
+
+    JS then catches an error named ``"ToolNotFoundError"`` and can branch on
+    it, the same as for any other Python exception class.
+    """
 
 
 class ToolBridge:

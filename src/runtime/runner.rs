@@ -250,22 +250,6 @@ impl SyncWatchdog {
     }
 }
 
-enum SnapshotSource {
-    Owned(OwnedSnapshot),
-}
-
-impl SnapshotSource {
-    fn from_vec(bytes: Vec<u8>) -> Self {
-        SnapshotSource::Owned(OwnedSnapshot::new(bytes))
-    }
-
-    fn as_static(&mut self) -> &'static [u8] {
-        match self {
-            SnapshotSource::Owned(owned) => owned.as_static(),
-        }
-    }
-}
-
 struct OwnedSnapshot {
     data: Option<Box<[u8]>>,
     leaked_ptr: Option<NonNull<[u8]>>,
@@ -823,6 +807,22 @@ impl RuntimeDispatcher {
         }
     }
 
+    /// Activate `job` if the runtime is free, otherwise queue it behind the
+    /// job that is running.
+    ///
+    /// Activation sets `job_just_activated`, which is what buys a new job its
+    /// one un-waited iteration; queueing must not, because the queued job does
+    /// not run until the active one finishes (and that path sets the flag
+    /// itself).
+    fn submit_job(&mut self, job: Box<dyn RuntimeJob>) {
+        if self.active_job.is_none() {
+            self.job_just_activated = true;
+            self.active_job = Some(job);
+        } else {
+            self.pending_jobs.push_back(job);
+        }
+    }
+
     /// Whether any job is active or queued.
     fn has_work(&self) -> bool {
         self.active_job.is_some() || !self.pending_jobs.is_empty()
@@ -903,23 +903,13 @@ impl RuntimeDispatcher {
                     }
                 };
 
-                // Create the job
-                let job = EvalAsyncJob::new(
+                self.submit_job(Box::new(eval_async_job(
                     code.clone(),
                     effective_timeout,
                     task_locals,
                     responder,
                     watchdog,
-                );
-
-                // Queue or activate the job
-                if self.active_job.is_none() {
-                    self.job_just_activated = true;
-                    self.active_job = Some(Box::new(job));
-                } else {
-                    // Another job is active - queue this one
-                    self.pending_jobs.push_back(Box::new(job));
-                }
+                )));
                 false
             }
             RuntimeCommand::RegisterPythonOp {
@@ -1057,22 +1047,13 @@ impl RuntimeDispatcher {
                     }
                 };
 
-                // Create the job
-                let job = EvalModuleAsyncJob::new(
+                self.submit_job(Box::new(EvalModuleAsyncJob::new(
                     specifier,
                     effective_timeout,
                     task_locals,
                     responder,
                     watchdog,
-                );
-
-                // Queue or activate the job
-                if self.active_job.is_none() {
-                    self.job_just_activated = true;
-                    self.active_job = Some(Box::new(job));
-                } else {
-                    self.pending_jobs.push_back(Box::new(job));
-                }
+                )));
                 false
             }
             RuntimeCommand::CallFunctionSync {
@@ -1117,8 +1098,7 @@ impl RuntimeDispatcher {
                     return false;
                 }
 
-                // Create the job
-                let job = CallFunctionAsyncJob::new(
+                let job = call_function_async_job(
                     fn_id,
                     args,
                     timeout_ms,
@@ -1126,14 +1106,7 @@ impl RuntimeDispatcher {
                     responder,
                     &self.core,
                 );
-
-                // Queue or activate the job
-                if self.active_job.is_none() {
-                    self.job_just_activated = true;
-                    self.active_job = Some(Box::new(job));
-                } else {
-                    self.pending_jobs.push_back(Box::new(job));
-                }
+                self.submit_job(Box::new(job));
                 false
             }
             RuntimeCommand::ResumeFunctionCall {
@@ -1158,14 +1131,8 @@ impl RuntimeDispatcher {
                     }
                 };
 
-                let job = ResumeFunctionCallJob::new(pending, task_locals, responder);
-
-                if self.active_job.is_none() {
-                    self.job_just_activated = true;
-                    self.active_job = Some(Box::new(job));
-                } else {
-                    self.pending_jobs.push_back(Box::new(job));
-                }
+                let job = resume_function_call_job(pending, task_locals, responder);
+                self.submit_job(Box::new(job));
                 false
             }
             RuntimeCommand::ReleaseFunction { fn_id, responder } => {
@@ -1184,13 +1151,7 @@ impl RuntimeDispatcher {
                 if self.core.should_reject_new_work() {
                     let _ = responder.send(Err(self.core.terminated_error()));
                 } else {
-                    let job = StreamReadJob::new(stream_id, responder);
-                    if self.active_job.is_none() {
-                        self.job_just_activated = true;
-                        self.active_job = Some(Box::new(job));
-                    } else {
-                        self.pending_jobs.push_back(Box::new(job));
-                    }
+                    self.submit_job(Box::new(stream_read_job(stream_id, responder)));
                 }
                 false
             }
@@ -1289,250 +1250,269 @@ trait RuntimeJob {
     }
 }
 
-/// State machine for async JavaScript evaluation
-struct EvalAsyncJob {
-    code: String,
+/// The two strings a job's timeout produces, kept per job so the shared
+/// deadline check below can reproduce each message verbatim.
+///
+/// `reason` lands on the termination controller (it is what
+/// `TerminationHandle` reports afterwards) and `error` + `error_suffix` become
+/// the `RuntimeError::timeout` the caller sees. They differ in wording only,
+/// which is the entire reason the five `poll` preambles used to be five.
+#[derive(Clone, Copy)]
+struct TimeoutWording {
+    reason: &'static str,
+    error: &'static str,
+    error_suffix: &'static str,
+}
+
+impl TimeoutWording {
+    const EVAL: Self = Self {
+        reason: "Asynchronous evaluation",
+        error: "Evaluation",
+        error_suffix: " (promise still pending)",
+    };
+    const EVAL_MODULE: Self = Self {
+        reason: "Asynchronous module evaluation",
+        error: "Module evaluation",
+        error_suffix: "",
+    };
+    const CALL_FUNCTION: Self = Self {
+        reason: "Asynchronous function call",
+        error: "Function call",
+        error_suffix: "",
+    };
+    /// A job with no deadline never formats either string.
+    const NONE: Self = Self {
+        reason: "",
+        error: "",
+        error_suffix: "",
+    };
+}
+
+/// The state every async job carries, and the two steps every `poll` opens
+/// with.
+///
+/// Before this existed each job repeated the same field clump, the same
+/// eight-line deadline check and the same verbatim task-locals installation.
+/// Both steps are load-bearing and neither may be skipped: the deadline check
+/// inside `poll` is what makes `timeout=` honest for a promise that never
+/// resolves (the dispatcher only bounds its park by `deadline()`; it does not
+/// enforce the timeout itself), and the task locals are what let a host op
+/// re-enter the caller's Python event loop.
+struct JobCommon {
     timeout_ms: Option<u64>,
     task_locals: Option<TaskLocals>,
     responder: oneshot::Sender<RuntimeResult<JSValue>>,
     start_time: Instant,
     deadline: Option<Instant>,
-    state: EvalAsyncJobState,
     watchdog: Option<SyncWatchdog>,
+    kind: RuntimeCallKind,
+    wording: TimeoutWording,
+    /// Context string for `apply_watchdog_result`, used only when a watchdog
+    /// is armed.
+    watchdog_context: &'static str,
 }
 
-enum EvalAsyncJobState {
-    /// Initial state - need to execute script and get promise
-    Init,
-    /// Waiting for promise to resolve (dispatcher drives event loop)
-    Waiting {
-        /// The promise being resolved - dispatcher drives it via poll_event_loop
-        promise: v8::Global<v8::Promise>,
-    },
-    /// Job completed
-    Done,
-}
-
-impl EvalAsyncJob {
+impl JobCommon {
+    /// A job whose deadline is derived from `timeout_ms` at construction time.
     fn new(
-        code: String,
+        kind: RuntimeCallKind,
+        wording: TimeoutWording,
+        watchdog_context: &'static str,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
         responder: oneshot::Sender<RuntimeResult<JSValue>>,
         watchdog: Option<SyncWatchdog>,
     ) -> Self {
         let start_time = Instant::now();
-
         let deadline = timeout_ms.map(|ms| start_time + Duration::from_millis(ms));
-
         Self {
-            code,
             timeout_ms,
             task_locals,
             responder,
             start_time,
             deadline,
-            state: EvalAsyncJobState::Init,
             watchdog,
-        }
-    }
-}
-
-impl RuntimeJob for EvalAsyncJob {
-    fn kind(&self) -> RuntimeCallKind {
-        RuntimeCallKind::EvalAsync
-    }
-
-    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
-        use std::task::Poll;
-
-        // Check timeout first
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
-                core.termination.ensure_reason(format!(
-                    "Asynchronous evaluation timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ));
-                core.termination.terminate_execution();
-                return Poll::Ready(Err(RuntimeError::timeout(format!(
-                    "Evaluation timed out after {}ms (promise still pending)",
-                    self.timeout_ms.unwrap_or(0)
-                ))));
-            }
-        }
-
-        match &mut self.state {
-            EvalAsyncJobState::Init => {
-                // Set up task locals
-                if let Some(ref locals) = self.task_locals {
-                    core.task_locals = Some(locals.clone());
-                    core.module_loader.set_task_locals(locals.clone());
-                    core.js_runtime
-                        .op_state()
-                        .borrow_mut()
-                        .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                }
-
-                // Execute the script
-                let global_value = match core
-                    .js_runtime
-                    .execute_script("<eval_async>", self.code.clone())
-                {
-                    Ok(val) => val,
-                    Err(err) => return Poll::Ready(Err(core.translate_js_error(*err))),
-                };
-
-                // Resolve the value to a promise
-                // The resolve() call wraps the value in a promise if it isn't already one
-                deno_core::scope!(scope, core.js_runtime);
-                let local_value = v8::Local::new(scope, global_value);
-
-                // Check if it's already a promise
-                let promise = if local_value.is_promise() {
-                    // Already a promise - use it directly
-                    v8::Local::<v8::Promise>::try_from(local_value)
-                        .map_err(|_| RuntimeError::internal("Failed to cast to Promise"))?
-                } else {
-                    // Not a promise - wrap in a resolved promise
-                    let resolver = v8::PromiseResolver::new(scope).ok_or_else(|| {
-                        RuntimeError::internal("Failed to create PromiseResolver")
-                    })?;
-                    resolver.resolve(scope, local_value);
-                    resolver.get_promise(scope)
-                };
-
-                // Store the promise as a Global handle
-                let promise_global = v8::Global::new(scope, promise);
-
-                // Transition to waiting state
-                self.state = EvalAsyncJobState::Waiting {
-                    promise: promise_global,
-                };
-
-                // Return pending - dispatcher will drive the event loop
-                Poll::Pending
-            }
-            EvalAsyncJobState::Waiting { promise } => {
-                // Check the promise state (dispatcher has been driving the event loop)
-                let promise_state = {
-                    deno_core::scope!(scope, core.js_runtime);
-                    let promise_local: v8::Local<v8::Promise> = v8::Local::new(scope, &*promise);
-                    promise_local.state()
-                };
-
-                match promise_state {
-                    v8::PromiseState::Pending => {
-                        // Still pending - dispatcher will continue driving event loop
-                        Poll::Pending
-                    }
-                    v8::PromiseState::Fulfilled => {
-                        // Promise resolved successfully
-                        let fn_registry = core.fn_registry.clone();
-                        let next_fn_id = core.next_fn_id.clone();
-                        let limits = core.serialization_limits;
-                        let stream_registry = core.js_stream_registry.clone();
-                        deno_core::scope!(scope, core.js_runtime);
-                        let promise_local: v8::Local<v8::Promise> =
-                            v8::Local::new(scope, &*promise);
-                        let result_value = promise_local.result(scope);
-                        let result = RuntimeCoreState::value_to_js_value(
-                            &fn_registry,
-                            &next_fn_id,
-                            scope,
-                            result_value,
-                            limits,
-                            stream_registry,
-                        );
-                        self.state = EvalAsyncJobState::Done;
-                        Poll::Ready(result)
-                    }
-                    v8::PromiseState::Rejected => {
-                        // Promise was rejected - extract error while scope is active
-                        let js_error = {
-                            deno_core::scope!(scope, core.js_runtime);
-                            let promise_local: v8::Local<v8::Promise> =
-                                v8::Local::new(scope, &*promise);
-                            let exception = promise_local.result(scope);
-                            *JsError::from_v8_exception(scope, exception)
-                        };
-                        // Scope dropped, now we can borrow core again
-                        let error = core.translate_js_error(js_error);
-                        self.state = EvalAsyncJobState::Done;
-                        Poll::Ready(Err(error))
-                    }
-                }
-            }
-            EvalAsyncJobState::Done => {
-                Poll::Ready(Err(RuntimeError::internal("Job already completed")))
-            }
+            kind,
+            wording,
+            watchdog_context,
         }
     }
 
-    fn finish(mut self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
-        let result = core.apply_watchdog_result(result, self.watchdog.take(), "Async evaluation");
+    /// A job that inherits an already-running call's clock, rather than
+    /// starting one. Used when a synchronous call turns out to have returned a
+    /// promise and is resumed as an async job: restarting the deadline there
+    /// would silently double the caller's timeout.
+    fn resumed(
+        kind: RuntimeCallKind,
+        wording: TimeoutWording,
+        watchdog_context: &'static str,
+        pending: &PendingFunctionCall,
+        task_locals: Option<TaskLocals>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
+    ) -> Self {
+        Self {
+            timeout_ms: pending.timeout_ms,
+            task_locals,
+            responder,
+            start_time: pending.start_time,
+            deadline: pending.deadline,
+            watchdog: None,
+            kind,
+            wording,
+            watchdog_context,
+        }
+    }
+
+    /// Returns the error to fail the job with if its deadline has passed,
+    /// having first asked V8 to stop executing.
+    fn expired(&self, core: &mut RuntimeCoreState) -> Option<RuntimeError> {
+        let deadline = self.deadline?;
+        if Instant::now() < deadline {
+            return None;
+        }
+        let ms = self.timeout_ms.unwrap_or(0);
+        core.termination
+            .ensure_reason(format!("{} timed out after {}ms", self.wording.reason, ms));
+        core.termination.terminate_execution();
+        Some(RuntimeError::timeout(format!(
+            "{} timed out after {}ms{}",
+            self.wording.error, ms, self.wording.error_suffix
+        )))
+    }
+
+    /// Publish the caller's Python task locals to everything on this thread
+    /// that can re-enter them.
+    fn install_task_locals(&self, core: &mut RuntimeCoreState) {
+        if let Some(ref locals) = self.task_locals {
+            core.task_locals = Some(locals.clone());
+            core.module_loader.set_task_locals(locals.clone());
+            core.js_runtime
+                .op_state()
+                .borrow_mut()
+                .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
+        }
+    }
+
+    /// Resolve the watchdog (a no-op when none is armed) and answer the caller.
+    fn respond(mut self, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
+        let result =
+            core.apply_watchdog_result(result, self.watchdog.take(), self.watchdog_context);
         let _ = self.responder.send(result);
     }
-
-    fn start_time(&self) -> Instant {
-        self.start_time
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
 }
 
-struct StreamReadJob {
-    stream_id: u32,
-    responder: oneshot::Sender<RuntimeResult<JSValue>>,
-    state: StreamReadJobState,
-    start_time: Instant,
+/// Produces the promise a [`PromiseJob`] then waits on. Runs once, on the
+/// runtime thread, during the job's first `poll`.
+type PromiseStart =
+    Box<dyn FnOnce(&mut RuntimeCoreState) -> RuntimeResult<v8::Global<v8::Promise>>>;
+
+/// Optional post-processing for a fulfilled promise's already-deserialized
+/// value, for the one job (stream reads) that has bookkeeping to do.
+type FulfilledHook = Box<dyn FnOnce(&mut RuntimeCoreState, JSValue) -> RuntimeResult<JSValue>>;
+
+/// The one async-job state machine: start something that yields a JS promise,
+/// then wait for that promise while the dispatcher drives the event loop.
+///
+/// Async evaluation, stream reads, async function calls and resumed function
+/// calls are all this machine; they differ only in the closure that produces
+/// the promise (and, for stream reads, in what happens to the fulfilled
+/// value). Module evaluation is genuinely a different shape -- it waits on a
+/// Rust future and then extracts a namespace, with no promise anywhere -- so
+/// it stays its own state machine below and shares only [`JobCommon`].
+struct PromiseJob {
+    common: JobCommon,
+    start: Option<PromiseStart>,
+    on_fulfilled: Option<FulfilledHook>,
+    state: PromiseJobState,
 }
 
-enum StreamReadJobState {
+enum PromiseJobState {
+    /// Nothing started yet; the next poll runs `start`.
     Init,
+    /// Waiting for the promise to settle. The dispatcher drives it via
+    /// `poll_event_loop`.
     Waiting { promise: v8::Global<v8::Promise> },
+    /// Settled and reported.
     Done,
 }
 
-impl StreamReadJob {
-    fn new(stream_id: u32, responder: oneshot::Sender<RuntimeResult<JSValue>>) -> Self {
+impl PromiseJob {
+    fn new(common: JobCommon, start: PromiseStart) -> Self {
         Self {
-            stream_id,
-            responder,
-            state: StreamReadJobState::Init,
-            start_time: Instant::now(),
+            common,
+            start: Some(start),
+            on_fulfilled: None,
+            state: PromiseJobState::Init,
         }
+    }
+
+    fn with_fulfilled_hook(mut self, hook: FulfilledHook) -> Self {
+        self.on_fulfilled = Some(hook);
+        self
+    }
+
+    /// Wrap `value` in a promise unless it already is one.
+    ///
+    /// `resolve()` on a fresh resolver is how a plain return value joins the
+    /// same waiting path as a real promise, so there is exactly one path to
+    /// maintain.
+    fn as_promise<'s>(
+        scope: &v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+    ) -> RuntimeResult<v8::Local<'s, v8::Promise>> {
+        if value.is_promise() {
+            return v8::Local::<v8::Promise>::try_from(value)
+                .map_err(|_| RuntimeError::internal("Failed to cast to Promise"));
+        }
+        let resolver = v8::PromiseResolver::new(scope)
+            .ok_or_else(|| RuntimeError::internal("Failed to create PromiseResolver"))?;
+        resolver.resolve(scope, value);
+        Ok(resolver.get_promise(scope))
     }
 }
 
-impl RuntimeJob for StreamReadJob {
+impl RuntimeJob for PromiseJob {
     fn kind(&self) -> RuntimeCallKind {
-        RuntimeCallKind::EvalAsync
+        self.common.kind
     }
 
     fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
         use std::task::Poll;
 
+        if let Some(err) = self.common.expired(core) {
+            return Poll::Ready(Err(err));
+        }
+
         match &mut self.state {
-            StreamReadJobState::Init => {
-                let promise = {
-                    deno_core::scope!(scope, core.js_runtime);
-                    core.js_stream_registry.start_read(scope, self.stream_id)
+            PromiseJobState::Init => {
+                self.common.install_task_locals(core);
+
+                let start = match self.start.take() {
+                    Some(start) => start,
+                    None => {
+                        self.state = PromiseJobState::Done;
+                        return Poll::Ready(Err(RuntimeError::internal(
+                            "Job started more than once",
+                        )));
+                    }
                 };
 
-                match promise {
+                match start(core) {
                     Ok(promise) => {
-                        self.state = StreamReadJobState::Waiting { promise };
+                        self.state = PromiseJobState::Waiting { promise };
+                        // The dispatcher drives the event loop from here; it
+                        // gives a freshly activated job one un-waited
+                        // iteration, so an already-resolved promise costs no
+                        // extra latency.
                         Poll::Pending
                     }
                     Err(err) => {
-                        self.state = StreamReadJobState::Done;
+                        self.state = PromiseJobState::Done;
                         Poll::Ready(Err(err))
                     }
                 }
             }
-            StreamReadJobState::Waiting { promise } => {
+            PromiseJobState::Waiting { promise } => {
                 let promise_state = {
                     deno_core::scope!(scope, core.js_runtime);
                     let promise_local: v8::Local<v8::Promise> = v8::Local::new(scope, &*promise);
@@ -1542,31 +1522,29 @@ impl RuntimeJob for StreamReadJob {
                 match promise_state {
                     v8::PromiseState::Pending => Poll::Pending,
                     v8::PromiseState::Fulfilled => {
-                        let chunk_js_value = {
+                        let value = {
+                            let fn_registry = core.fn_registry.clone();
+                            let next_fn_id = core.next_fn_id.clone();
+                            let limits = core.serialization_limits;
                             let stream_registry = core.js_stream_registry.clone();
                             deno_core::scope!(scope, core.js_runtime);
                             let promise_local: v8::Local<v8::Promise> =
                                 v8::Local::new(scope, &*promise);
-                            let chunk_value = promise_local.result(scope);
-                            let limits = core.serialization_limits;
+                            let result_value = promise_local.result(scope);
                             RuntimeCoreState::value_to_js_value(
-                                &core.fn_registry,
-                                &core.next_fn_id,
+                                &fn_registry,
+                                &next_fn_id,
                                 scope,
-                                chunk_value,
+                                result_value,
                                 limits,
                                 stream_registry,
                             )
-                        }?;
-
-                        let chunk = StreamChunk::from_js_value(chunk_js_value)?;
-                        core.js_stream_registry
-                            .update_stats_after_chunk(self.stream_id, &chunk);
-                        if chunk.done {
-                            core.js_stream_registry.release(self.stream_id);
-                        }
-                        self.state = StreamReadJobState::Done;
-                        Poll::Ready(Ok(chunk.to_js_value()))
+                        };
+                        self.state = PromiseJobState::Done;
+                        Poll::Ready(match (value, self.on_fulfilled.take()) {
+                            (Ok(value), Some(hook)) => hook(core, value),
+                            (other, _) => other,
+                        })
                     }
                     v8::PromiseState::Rejected => {
                         let js_error = {
@@ -1576,36 +1554,112 @@ impl RuntimeJob for StreamReadJob {
                             let exception = promise_local.result(scope);
                             *JsError::from_v8_exception(scope, exception)
                         };
-                        self.state = StreamReadJobState::Done;
-                        Poll::Ready(Err(core.translate_js_error(js_error)))
+                        // Scope dropped, so `core` can be borrowed again.
+                        let error = core.translate_js_error(js_error);
+                        self.state = PromiseJobState::Done;
+                        Poll::Ready(Err(error))
                     }
                 }
             }
-            StreamReadJobState::Done => {
-                Poll::Ready(Err(RuntimeError::internal("Stream read already completed")))
+            PromiseJobState::Done => {
+                Poll::Ready(Err(RuntimeError::internal("Job already completed")))
             }
         }
     }
 
-    fn finish(self: Box<Self>, _core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
-        let _ = self.responder.send(result);
+    fn finish(self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
+        self.common.respond(core, result);
     }
 
     fn start_time(&self) -> Instant {
-        self.start_time
+        self.common.start_time
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.common.deadline
     }
 }
 
-/// State machine for async module evaluation
-struct EvalModuleAsyncJob {
-    specifier: String,
+/// Async evaluation: run the script, then await whatever it produced.
+fn eval_async_job(
+    code: String,
     timeout_ms: Option<u64>,
     task_locals: Option<TaskLocals>,
     responder: oneshot::Sender<RuntimeResult<JSValue>>,
-    start_time: Instant,
-    deadline: Option<Instant>,
-    state: EvalModuleAsyncJobState,
     watchdog: Option<SyncWatchdog>,
+) -> PromiseJob {
+    let common = JobCommon::new(
+        RuntimeCallKind::EvalAsync,
+        TimeoutWording::EVAL,
+        "Async evaluation",
+        timeout_ms,
+        task_locals,
+        responder,
+        watchdog,
+    );
+
+    PromiseJob::new(
+        common,
+        Box::new(move |core: &mut RuntimeCoreState| {
+            let global_value = core
+                .js_runtime
+                .execute_script("<eval_async>", code)
+                .map_err(|err| core.translate_js_error(*err))?;
+
+            deno_core::scope!(scope, core.js_runtime);
+            let local_value = v8::Local::new(scope, global_value);
+            let promise = PromiseJob::as_promise(scope, local_value)?;
+            Ok(v8::Global::new(scope, promise))
+        }),
+    )
+}
+
+/// One read from a JS `ReadableStream`, with the chunk bookkeeping the stream
+/// registry needs once the read resolves.
+fn stream_read_job(
+    stream_id: u32,
+    responder: oneshot::Sender<RuntimeResult<JSValue>>,
+) -> PromiseJob {
+    let common = JobCommon::new(
+        RuntimeCallKind::EvalAsync,
+        TimeoutWording::NONE,
+        "Stream read",
+        None,
+        None,
+        responder,
+        None,
+    );
+
+    PromiseJob::new(
+        common,
+        Box::new(move |core: &mut RuntimeCoreState| {
+            deno_core::scope!(scope, core.js_runtime);
+            core.js_stream_registry.start_read(scope, stream_id)
+        }),
+    )
+    .with_fulfilled_hook(Box::new(
+        move |core: &mut RuntimeCoreState, value: JSValue| {
+            let chunk = StreamChunk::from_js_value(value)?;
+            core.js_stream_registry
+                .update_stats_after_chunk(stream_id, &chunk);
+            if chunk.done {
+                core.js_stream_registry.release(stream_id);
+            }
+            Ok(chunk.to_js_value())
+        },
+    ))
+}
+
+/// Async module evaluation.
+///
+/// Unlike every other async job this one has no promise: `mod_evaluate`
+/// returns a Rust future, and the module namespace is only reachable once that
+/// future is ready. It shares [`JobCommon`] (and so the deadline check, the
+/// task-locals installation and the watchdog handling) and nothing else.
+struct EvalModuleAsyncJob {
+    specifier: String,
+    common: JobCommon,
+    state: EvalModuleAsyncJobState,
 }
 
 enum EvalModuleAsyncJobState {
@@ -1630,57 +1684,37 @@ impl EvalModuleAsyncJob {
         responder: oneshot::Sender<RuntimeResult<JSValue>>,
         watchdog: Option<SyncWatchdog>,
     ) -> Self {
-        let start_time = Instant::now();
-
-        let deadline = timeout_ms.map(|ms| start_time + Duration::from_millis(ms));
-
         Self {
             specifier,
-            timeout_ms,
-            task_locals,
-            responder,
-            start_time,
-            deadline,
+            common: JobCommon::new(
+                RuntimeCallKind::EvalModuleAsync,
+                TimeoutWording::EVAL_MODULE,
+                "Async module evaluation",
+                timeout_ms,
+                task_locals,
+                responder,
+                watchdog,
+            ),
             state: EvalModuleAsyncJobState::Init,
-            watchdog,
         }
     }
 }
 
 impl RuntimeJob for EvalModuleAsyncJob {
     fn kind(&self) -> RuntimeCallKind {
-        RuntimeCallKind::EvalModuleAsync
+        self.common.kind
     }
 
     fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
         use std::task::Poll;
 
-        // Check timeout
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
-                core.termination.ensure_reason(format!(
-                    "Asynchronous module evaluation timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ));
-                core.termination.terminate_execution();
-                return Poll::Ready(Err(RuntimeError::timeout(format!(
-                    "Module evaluation timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ))));
-            }
+        if let Some(err) = self.common.expired(core) {
+            return Poll::Ready(Err(err));
         }
 
         match &mut self.state {
             EvalModuleAsyncJobState::Init => {
-                // Set up task locals
-                if let Some(ref locals) = self.task_locals {
-                    core.task_locals = Some(locals.clone());
-                    core.module_loader.set_task_locals(locals.clone());
-                    core.js_runtime
-                        .op_state()
-                        .borrow_mut()
-                        .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                }
+                self.common.install_task_locals(core);
 
                 // Parse module specifier
                 let module_specifier =
@@ -1786,396 +1820,138 @@ impl RuntimeJob for EvalModuleAsyncJob {
         }
     }
 
-    fn finish(mut self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
-        let result =
-            core.apply_watchdog_result(result, self.watchdog.take(), "Async module evaluation");
-        let _ = self.responder.send(result);
+    fn finish(self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
+        self.common.respond(core, result);
     }
 
     fn start_time(&self) -> Instant {
-        self.start_time
+        self.common.start_time
     }
 
     fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        self.common.deadline
     }
 }
 
-/// State machine for async function calls
-struct CallFunctionAsyncJob {
+/// An async call of a stored JS function: look the function up, call it, then
+/// await the result.
+fn call_function_async_job(
     fn_id: u32,
     args: Vec<JSValue>,
     timeout_ms: Option<u64>,
     task_locals: Option<TaskLocals>,
     responder: oneshot::Sender<RuntimeResult<JSValue>>,
-    start_time: Instant,
-    deadline: Option<Instant>,
-    state: CallFunctionAsyncJobState,
-}
-
-enum CallFunctionAsyncJobState {
-    Init,
-    Waiting { promise: v8::Global<v8::Promise> },
-    Done,
-}
-
-impl CallFunctionAsyncJob {
-    fn new(
-        fn_id: u32,
-        args: Vec<JSValue>,
-        timeout_ms: Option<u64>,
-        task_locals: Option<TaskLocals>,
-        responder: oneshot::Sender<RuntimeResult<JSValue>>,
-        core: &RuntimeCoreState,
-    ) -> Self {
-        let start_time = Instant::now();
-
-        let effective_timeout = timeout_ms.or_else(|| {
-            core.execution_timeout.map(|d| {
-                let millis = d.as_millis();
-                if millis > u128::from(u64::MAX) {
-                    u64::MAX
-                } else {
-                    millis as u64
-                }
-            })
-        });
-
-        let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
-
-        Self {
-            fn_id,
-            args,
-            timeout_ms: effective_timeout,
-            task_locals,
-            responder,
-            start_time,
-            deadline,
-            state: CallFunctionAsyncJobState::Init,
-        }
-    }
-}
-
-impl RuntimeJob for CallFunctionAsyncJob {
-    fn kind(&self) -> RuntimeCallKind {
-        RuntimeCallKind::CallFunctionAsync
-    }
-
-    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
-        use std::task::Poll;
-
-        // Check timeout
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
-                core.termination.ensure_reason(format!(
-                    "Asynchronous function call timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ));
-                core.termination.terminate_execution();
-                return Poll::Ready(Err(RuntimeError::timeout(format!(
-                    "Function call timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ))));
+    core: &RuntimeCoreState,
+) -> PromiseJob {
+    // An explicit `timeout=` wins; otherwise the runtime-wide execution
+    // timeout applies, so an async call is bounded by the same clock as a
+    // synchronous one.
+    let effective_timeout = timeout_ms.or_else(|| {
+        core.execution_timeout.map(|d| {
+            let millis = d.as_millis();
+            if millis > u128::from(u64::MAX) {
+                u64::MAX
+            } else {
+                millis as u64
             }
-        }
+        })
+    });
 
-        match &mut self.state {
-            CallFunctionAsyncJobState::Init => {
-                // Set up task locals
-                if let Some(ref locals) = self.task_locals {
-                    core.task_locals = Some(locals.clone());
-                    core.module_loader.set_task_locals(locals.clone());
-                    core.js_runtime
-                        .op_state()
-                        .borrow_mut()
-                        .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                }
+    let common = JobCommon::new(
+        RuntimeCallKind::CallFunctionAsync,
+        TimeoutWording::CALL_FUNCTION,
+        "Async function call",
+        effective_timeout,
+        task_locals,
+        responder,
+        None,
+    );
 
-                // Look up function, call it, and convert result to promise - all in one scope
-                // Check for missing function first (before entering scope)
-                if !core.fn_registry.borrow().contains_key(&self.fn_id) {
-                    return Poll::Ready(Err(RuntimeError::internal(format!(
-                        "Function ID {} not found",
-                        self.fn_id
-                    ))));
-                }
-
-                let promise_result: Result<Result<v8::Global<v8::Promise>, JsError>, RuntimeError> =
-                    (|| {
-                        deno_core::scope!(scope, core.js_runtime);
-                        v8::tc_scope!(let try_catch, scope);
-
-                        // Get function and receiver from registry
-                        let (func, receiver) = {
-                            let registry = core.fn_registry.borrow();
-                            let stored = registry.get(&self.fn_id).unwrap(); // Safe: checked above
-                            let func = v8::Local::new(try_catch, &stored.function);
-                            let receiver = stored
-                                .receiver
-                                .as_ref()
-                                .map(|r| v8::Local::new(try_catch, r));
-                            (func, receiver)
-                        };
-
-                        // Convert arguments
-                        let mut v8_args = Vec::with_capacity(self.args.len());
-                        for arg in &self.args {
-                            let v8_val = RuntimeCoreState::js_value_to_v8(
-                                &core.fn_registry,
-                                try_catch,
-                                arg,
-                            )?;
-                            v8_args.push(v8_val);
-                        }
-
-                        let call_receiver = receiver.unwrap_or_else(|| {
-                            try_catch.get_current_context().global(try_catch).into()
-                        });
-
-                        // Call the function and convert result to promise
-                        match func.call(try_catch, call_receiver, &v8_args) {
-                            Some(result_value) => {
-                                // Check if result is a promise and wrap if needed
-                                let promise = if result_value.is_promise() {
-                                    v8::Local::<v8::Promise>::try_from(result_value).map_err(
-                                        |_| RuntimeError::internal("Failed to cast to Promise"),
-                                    )?
-                                } else {
-                                    // Not a promise - wrap in resolved promise
-                                    let resolver =
-                                        v8::PromiseResolver::new(try_catch).ok_or_else(|| {
-                                            RuntimeError::internal(
-                                                "Failed to create PromiseResolver",
-                                            )
-                                        })?;
-                                    resolver.resolve(try_catch, result_value);
-                                    resolver.get_promise(try_catch)
-                                };
-                                Ok(Ok(v8::Global::new(try_catch, promise)))
-                            }
-                            None => match try_catch.exception() {
-                                Some(exception) => {
-                                    let js_error = JsError::from_v8_exception(try_catch, exception);
-                                    Ok(Err(*js_error))
-                                }
-                                None => Err(RuntimeError::internal(
-                                    "Function call failed with no exception",
-                                )),
-                            },
-                        }
-                    })();
-
-                // Handle the result outside the scope
-                let promise_global = match promise_result {
-                    Ok(Ok(p)) => p,
-                    Ok(Err(js_error)) => {
-                        return Poll::Ready(Err(core.translate_js_error(js_error)));
-                    }
-                    Err(err) => {
-                        return Poll::Ready(Err(err));
-                    }
-                };
-
-                self.state = CallFunctionAsyncJobState::Waiting {
-                    promise: promise_global,
-                };
-                Poll::Pending
+    PromiseJob::new(
+        common,
+        Box::new(move |core: &mut RuntimeCoreState| {
+            // Check for a missing function before entering a scope.
+            if !core.fn_registry.borrow().contains_key(&fn_id) {
+                return Err(RuntimeError::internal(format!(
+                    "Function ID {} not found",
+                    fn_id
+                )));
             }
-            CallFunctionAsyncJobState::Waiting { promise } => {
-                // Check promise state
-                let promise_state = {
+
+            let promise_result: Result<Result<v8::Global<v8::Promise>, JsError>, RuntimeError> =
+                (|| {
                     deno_core::scope!(scope, core.js_runtime);
-                    let promise_local: v8::Local<v8::Promise> = v8::Local::new(scope, &*promise);
-                    promise_local.state()
-                };
+                    v8::tc_scope!(let try_catch, scope);
 
-                match promise_state {
-                    v8::PromiseState::Pending => Poll::Pending,
-                    v8::PromiseState::Fulfilled => {
-                        let fn_registry = core.fn_registry.clone();
-                        let next_fn_id = core.next_fn_id.clone();
-                        let limits = core.serialization_limits;
-                        let stream_registry = core.js_stream_registry.clone();
-                        deno_core::scope!(scope, core.js_runtime);
-                        let promise_local: v8::Local<v8::Promise> =
-                            v8::Local::new(scope, &*promise);
-                        let result_value = promise_local.result(scope);
-                        let result = RuntimeCoreState::value_to_js_value(
-                            &fn_registry,
-                            &next_fn_id,
-                            scope,
-                            result_value,
-                            limits,
-                            stream_registry,
-                        );
-                        self.state = CallFunctionAsyncJobState::Done;
-                        Poll::Ready(result)
+                    // Get function and receiver from registry
+                    let (func, receiver) = {
+                        let registry = core.fn_registry.borrow();
+                        let stored = registry.get(&fn_id).unwrap(); // Safe: checked above
+                        let func = v8::Local::new(try_catch, &stored.function);
+                        let receiver = stored
+                            .receiver
+                            .as_ref()
+                            .map(|r| v8::Local::new(try_catch, r));
+                        (func, receiver)
+                    };
+
+                    // Convert arguments
+                    let mut v8_args = Vec::with_capacity(args.len());
+                    for arg in &args {
+                        let v8_val =
+                            RuntimeCoreState::js_value_to_v8(&core.fn_registry, try_catch, arg)?;
+                        v8_args.push(v8_val);
                     }
-                    v8::PromiseState::Rejected => {
-                        let js_error = {
-                            deno_core::scope!(scope, core.js_runtime);
-                            let promise_local: v8::Local<v8::Promise> =
-                                v8::Local::new(scope, &*promise);
-                            let exception = promise_local.result(scope);
-                            *JsError::from_v8_exception(scope, exception)
-                        };
-                        let error = core.translate_js_error(js_error);
-                        self.state = CallFunctionAsyncJobState::Done;
-                        Poll::Ready(Err(error))
+
+                    let call_receiver = receiver.unwrap_or_else(|| {
+                        try_catch.get_current_context().global(try_catch).into()
+                    });
+
+                    match func.call(try_catch, call_receiver, &v8_args) {
+                        Some(result_value) => {
+                            let promise = PromiseJob::as_promise(try_catch, result_value)?;
+                            Ok(Ok(v8::Global::new(try_catch, promise)))
+                        }
+                        None => match try_catch.exception() {
+                            Some(exception) => {
+                                let js_error = JsError::from_v8_exception(try_catch, exception);
+                                Ok(Err(*js_error))
+                            }
+                            None => Err(RuntimeError::internal(
+                                "Function call failed with no exception",
+                            )),
+                        },
                     }
-                }
+                })();
+
+            // Handle the result outside the scope, so `core` is free again.
+            match promise_result {
+                Ok(Ok(promise)) => Ok(promise),
+                Ok(Err(js_error)) => Err(core.translate_js_error(js_error)),
+                Err(err) => Err(err),
             }
-            CallFunctionAsyncJobState::Done => {
-                Poll::Ready(Err(RuntimeError::internal("Job already completed")))
-            }
-        }
-    }
-
-    fn finish(self: Box<Self>, _core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
-        let _ = self.responder.send(result);
-    }
-
-    fn start_time(&self) -> Instant {
-        self.start_time
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
+        }),
+    )
 }
 
-/// Job that resumes a previously-started JS function by awaiting its stored promise.
-struct ResumeFunctionCallJob {
-    promise: v8::Global<v8::Promise>,
+/// Resume a previously-started JS function call by awaiting its stored
+/// promise, on the original call's clock.
+fn resume_function_call_job(
+    pending: PendingFunctionCall,
     task_locals: Option<TaskLocals>,
     responder: oneshot::Sender<RuntimeResult<JSValue>>,
-    start_time: Instant,
-    deadline: Option<Instant>,
-    timeout_ms: Option<u64>,
-    state: ResumeFunctionCallJobState,
-}
+) -> PromiseJob {
+    let common = JobCommon::resumed(
+        RuntimeCallKind::CallFunctionAsync,
+        TimeoutWording::CALL_FUNCTION,
+        "Async function call",
+        &pending,
+        task_locals,
+        responder,
+    );
 
-enum ResumeFunctionCallJobState {
-    Init,
-    Waiting,
-    Done,
-}
-
-impl ResumeFunctionCallJob {
-    fn new(
-        pending: PendingFunctionCall,
-        task_locals: Option<TaskLocals>,
-        responder: oneshot::Sender<RuntimeResult<JSValue>>,
-    ) -> Self {
-        Self {
-            promise: pending.promise,
-            task_locals,
-            responder,
-            start_time: pending.start_time,
-            deadline: pending.deadline,
-            timeout_ms: pending.timeout_ms,
-            state: ResumeFunctionCallJobState::Init,
-        }
-    }
-}
-
-impl RuntimeJob for ResumeFunctionCallJob {
-    fn kind(&self) -> RuntimeCallKind {
-        RuntimeCallKind::CallFunctionAsync
-    }
-
-    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
-        use std::task::Poll;
-
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
-                core.termination.ensure_reason(format!(
-                    "Asynchronous function call timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ));
-                core.termination.terminate_execution();
-                return Poll::Ready(Err(RuntimeError::timeout(format!(
-                    "Function call timed out after {}ms",
-                    self.timeout_ms.unwrap_or(0)
-                ))));
-            }
-        }
-
-        loop {
-            match self.state {
-                ResumeFunctionCallJobState::Init => {
-                    if let Some(ref locals) = self.task_locals {
-                        core.task_locals = Some(locals.clone());
-                        core.module_loader.set_task_locals(locals.clone());
-                        core.js_runtime
-                            .op_state()
-                            .borrow_mut()
-                            .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                    }
-                    self.state = ResumeFunctionCallJobState::Waiting;
-                }
-                ResumeFunctionCallJobState::Waiting => {
-                    let promise_state = {
-                        deno_core::scope!(scope, core.js_runtime);
-                        let promise_local: v8::Local<v8::Promise> =
-                            v8::Local::new(scope, &self.promise);
-                        promise_local.state()
-                    };
-
-                    return match promise_state {
-                        v8::PromiseState::Pending => Poll::Pending,
-                        v8::PromiseState::Fulfilled => {
-                            let fn_registry = core.fn_registry.clone();
-                            let next_fn_id = core.next_fn_id.clone();
-                            let limits = core.serialization_limits;
-                            let stream_registry = core.js_stream_registry.clone();
-                            deno_core::scope!(scope, core.js_runtime);
-                            let promise_local: v8::Local<v8::Promise> =
-                                v8::Local::new(scope, &self.promise);
-                            let result_value = promise_local.result(scope);
-                            let result = RuntimeCoreState::value_to_js_value(
-                                &fn_registry,
-                                &next_fn_id,
-                                scope,
-                                result_value,
-                                limits,
-                                stream_registry,
-                            );
-                            self.state = ResumeFunctionCallJobState::Done;
-                            Poll::Ready(result)
-                        }
-                        v8::PromiseState::Rejected => {
-                            let js_error = {
-                                deno_core::scope!(scope, core.js_runtime);
-                                let promise_local: v8::Local<v8::Promise> =
-                                    v8::Local::new(scope, &self.promise);
-                                let exception = promise_local.result(scope);
-                                *JsError::from_v8_exception(scope, exception)
-                            };
-                            let error = core.translate_js_error(js_error);
-                            self.state = ResumeFunctionCallJobState::Done;
-                            Poll::Ready(Err(error))
-                        }
-                    };
-                }
-                ResumeFunctionCallJobState::Done => {
-                    return Poll::Ready(Err(RuntimeError::internal("Job already completed")));
-                }
-            }
-        }
-    }
-
-    fn finish(self: Box<Self>, _core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
-        let _ = self.responder.send(result);
-    }
-
-    fn start_time(&self) -> Instant {
-        self.start_time
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
+    let promise = pending.promise;
+    PromiseJob::new(common, Box::new(move |_core| Ok(promise)))
 }
 
 pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntimeResult> {
@@ -2285,7 +2061,7 @@ struct RuntimeCoreState {
     terminated: bool,
     inspector_state: Option<InspectorRuntimeState>,
     #[allow(dead_code)]
-    startup_snapshot: Option<SnapshotSource>,
+    startup_snapshot: Option<OwnedSnapshot>,
     serialization_limits: SerializationLimits,
     js_stream_registry: Rc<JsStreamRegistry>,
     py_stream_registry: PyStreamRegistry,
@@ -2339,7 +2115,7 @@ impl RuntimeCoreState {
         let serialization_limits =
             SerializationLimits::new(max_serialization_depth, max_serialization_bytes);
 
-        let mut snapshot_source = snapshot.map(SnapshotSource::from_vec);
+        let mut snapshot_source = snapshot.map(OwnedSnapshot::new);
         let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
 
         let inspector_enabled = inspector.is_some();

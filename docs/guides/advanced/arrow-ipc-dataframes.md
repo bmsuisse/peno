@@ -17,7 +17,8 @@ so there is no schema negotiation to write on either side.
 `src/runtime/conversion.rs` already maps Python `bytes` to `JSValue::Bytes`,
 which surfaces in JS as a `Uint8Array`. There is no Rust dependency to add,
 no optional extra to install, and nothing to enable -- the numbers below
-were measured against an unmodified release build of `main` (v0.2.2).
+were measured against an unmodified release build of `main` (the
+development state between v0.2.1 and v0.3.0).
 
 ## When to use this -- and when not to
 
@@ -157,7 +158,7 @@ end to end against 253 ms.
 
 !!! note "These numbers are machine-dependent"
     Measured on macOS 15 / Apple Silicon, CPython 3.14, a `--release` build
-    of `peno` v0.2.2, `pyarrow` 25.0.1 and `apache-arrow` 21.2.0.
+    of `peno` 0.3.0, `pyarrow` 25.0.1 and `apache-arrow` 21.2.0.
     Treat them as one data point about the *shape* of the curve -- roughly
     flat for Arrow, roughly linear for JSON -- not as universal figures.
     Re-run `examples/arrow_ipc_dataframes.py` to get your own; it prints

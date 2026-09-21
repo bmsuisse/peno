@@ -65,6 +65,7 @@ nav:
   - Contributing:
       - Development: contributing/development.md
       - Architecture: contributing/architecture.md
+      - Upstream provenance: contributing/upstream-divergence.md
 
 plugins:
   - search

@@ -8,9 +8,10 @@ invariant that must hold for *every* input a sandbox is handed:
     exception -- never SIGABRT, never a Rust panic, never a hang.
 
 That invariant is the whole product promise of a sandbox, and it is exactly
-what the two tokio-context SIGABRT bugs violated (see PATCH_LARGE_SCRIPT_ABORT.md
-and PATCH_SNAPSHOT_ABORT.md): a crash there takes down the *host* process, so
-no amount of Python-side error handling can recover from it.
+what the two tokio-context SIGABRT bugs violated (see
+`docs/contributing/upstream-divergence.md`, sections 2 and 3): a crash there
+takes down the *host* process, so no amount of Python-side error handling can
+recover from it.
 
 Every test here runs in-process, so a regression that aborts the process shows
 up as the whole test session dying rather than as a failure -- which is the
@@ -222,7 +223,7 @@ class TestAdversarialSource:
         max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow]
     )
     def test_source_around_the_streaming_compile_threshold(self, size: int) -> None:
-        """Directly targets the regression class of PATCH_LARGE_SCRIPT_ABORT.md
+        """Directly targets the SIGABRT regression class (upstream-divergence 2)
         by generating sizes on both sides of V8's streaming-compile threshold."""
         _eval_must_not_crash(f"/* {'x' * size} */ 1")
 
@@ -240,7 +241,7 @@ class TestAdversarialSource:
         surface as an exception, not wedge the process.
 
         This is the test that would fail if the cross-thread termination
-        handle (PATCH.md) regressed.
+        handle (upstream-divergence section 1) regressed.
         """
         escaped_pattern = pattern.replace("\\", "\\\\").replace("'", "\\'")
         escaped_subject = subject.replace("\\", "\\\\").replace("'", "\\'")
