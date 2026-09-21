@@ -333,6 +333,45 @@ the armed path's median stays within 15x the unarmed path's median, measured in
 the same process on the same warm runtime -- a ratio, because absolute timings
 are the part that moves between machines. Against v0.2.0 it fails at ~265x.
 
+## The job-consolidation refactor costs nothing (v0.3.0)
+
+0.3.0 replaced five near-identical `RuntimeJob` state machines with one
+`PromiseJob` plus four closures (`src/runtime/runner.rs`, -224 net lines).
+Everything that refactor touches is on a latency path, so it was measured
+rather than asserted: the same script against `main` @ 11fa913 and against the
+refactor, release builds, same machine and session.
+
+| | main @ 11fa913 | 0.3.0 |
+|---|---|---|
+| Host tool call, no deadline | 0.019 ms | 0.018 / 0.016 ms |
+| Host tool call, `timeout=0.5` | 0.017 ms | 0.017 / 0.016 ms |
+| Host tool call, `timeout=5` | 0.017 ms | 0.016 / 0.016 ms |
+| `eval_async` on a resolved promise | 0.049 ms | 0.049 ms |
+| Idle CPU, 8 retained runtimes | 0.0% | 0.0% |
+| Parked kill, `new Promise(() => {})` | 8.97 ms | 9.56 / 10.05 ms |
+| Parked kill, `await` on a parked promise | 8.84 ms | 9.01 / 10.10 ms |
+| Parked kill, `.then` on a parked promise | 9.99 ms | 8.52 / 10.15 ms |
+
+Two columns for 0.3.0 because two runs were taken: the spread between repeats
+of the *same* build is as large as the spread between builds, which is the
+point. The armed/unarmed ratio stays ~1.0, so the 0.2.1 `Condvar` fix is
+intact; idle CPU stays at zero, so the parking is intact; and the parked kills
+are unchanged, so the termination-flag check between polls still runs for every
+job.
+
+The parked-kill figures here are ~9 ms rather than the ~0.3 ms in the section
+above because this harness charges the killer thread's own setup to the
+measurement (`asyncio.run` plus a `Runtime` construction between `t0` and the
+`terminate()`). It is a *comparison* harness, not a replacement for the
+absolute numbers; both columns pay the same overhead. The absolute figures are
+the ones in [Bounded termination for parked promises](#bounded-termination-for-parked-promises-v020).
+
+The suite's own permanent regression tests are the other half of this evidence
+and all pass in both profiles: `test_timeout_overhead.py` (armed vs unarmed
+ratio), `test_idle_cpu.py` (idle budget and latency flatness to K=3x cores),
+`test_parked_termination.py` (15 cases over both kill tiers) and
+`test_tool_bridge.py` (budgets across the op boundary).
+
 ## Reproducing
 
 ```bash
