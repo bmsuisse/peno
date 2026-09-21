@@ -133,6 +133,12 @@ class RuntimeConfig:
             inspector: Optional inspector configuration enabling Chrome DevTools
             snapshot: Optional V8 startup snapshot bytes
             max_serialization_depth: Maximum nesting depth when transferring values
+                (default 100). Raising it past roughly 900 is unsafe if you then
+                pass a deep argument from a small-stack thread: the Python-to-JS
+                conversion recurses on the *calling* thread, and a
+                ``threading.Thread`` gets 512 KB on macOS, which peno cannot
+                change. The default has ~9x of headroom on such a thread; see
+                ``RUNTIME_THREAD_STACK_SIZE`` in ``src/runtime/js_value.rs``.
             max_serialization_bytes: Maximum serialized byte size when transferring values
             force_kill_grace: How long a blocked caller waits for the runtime to
                 acknowledge a termination before abandoning the runtime thread and

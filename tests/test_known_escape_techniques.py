@@ -537,7 +537,7 @@ class TestResourceExhaustion:
     Root cause:  A sandbox that cannot be *stopped* is not a sandbox: guest
                  code that loops forever or allocates without bound takes the
                  host down with it.
-    Relevance:   peno has a cross-thread termination handle (PATCH.md)
+    Relevance:   peno has a cross-thread termination handle
                  and a heap limit that terminates execution. These are the
                  regression tests for that being reachable from the public
                  API; the fuzz suite generates many more such programs.

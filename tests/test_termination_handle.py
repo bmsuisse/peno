@@ -1,11 +1,11 @@
 """Proof that the TerminationHandle fix works: the exact watchdog-thread test
-that broke unpatched peno (see PATCH.md). Run directly with the patched
-interpreter:
+that broke unpatched peno. See `docs/contributing/upstream-divergence.md`
+section 1 for the root cause. Run directly with the patched interpreter:
 
     python tests/test_termination_handle.py
 
 Not wired into pytest/CI -- this is a standalone repro script by design, a
-regression check for the exact bug PATCH.md documents, not a full suite.
+regression check for that one bug, not a full suite.
 """
 
 from __future__ import annotations

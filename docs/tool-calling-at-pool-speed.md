@@ -360,7 +360,7 @@ Two constraints to design around:
   and not a blocker — but sharing one buffer (`Arc<[u8]>` Rust-side) is the
   obvious follow-up if K ever gets large.
 
-On the prior `will_snapshot` finding: `PATCH_SNAPSHOT_ABORT.md` established
+On the prior `will_snapshot` finding: `contributing/upstream-divergence.md` (section 3) established
 that `will_snapshot = true` routes isolate creation through V8's
 `SnapshotCreator`, which appears to force synchronous compilation and is why
 the large-script SIGABRT never reproduced on the builder path. That finding
@@ -374,7 +374,7 @@ and should not be conflated.
 Vendoring `deno_core` to make `JsRealm` public would enable one `JsRuntime`
 to multiplex many `Context`s — true "pooled ops". Priced honestly, and not
 declined reflexively; this project has forked a crate before when the
-alternative was worse (`PATCH.md`).
+alternative was worse (`contributing/upstream-divergence.md`, section 1).
 
 **What it would buy:** fresh-`Context`-per-call *with* ops available. By
 construction that lands at roughly pool cost — the 167 µs checkout is
@@ -412,7 +412,7 @@ instead of a permanent 12x latency regression on every hit.
 - V8 upgrades land precisely in this area (context/realm/snapshot internals
   churn between V8 majors), so the upgrade tax concentrates on the forked
   surface rather than being spread thinly.
-- The existing fork this project maintains (`PATCH.md`) is a narrow,
+- The existing fork this project maintains (`contributing/upstream-divergence.md`, section 1) is a narrow,
   additive termination-handle change. `JsRealm` visibility is a structural
   one. They are not comparable precedents.
 

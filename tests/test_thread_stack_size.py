@@ -191,3 +191,53 @@ def test_deeply_nested_literals_never_kill_a_pooled_isolate() -> None:
     """)
     _assert_child_survived(completed)
     assert "survived" in completed.stdout
+
+
+def test_a_deep_python_argument_from_a_small_thread_does_not_kill_the_host() -> None:
+    """The one recursion `RUNTIME_THREAD_STACK_SIZE` cannot cover.
+
+    `python_to_js_value` runs on whichever thread *called* -- it has to, it
+    needs the caller's GIL and its objects -- so the 16 MiB reservation on the
+    runtime thread does nothing for it. A `threading.Thread` gets 512 KB on
+    macOS and `peno` cannot change that from inside the call.
+
+    At the default `max_serialization_depth` of 100 there is roughly 9x of
+    headroom: measured on a debug build, a 512 KB caller thread survives depth
+    900 and dies at 1000 (~512 bytes per frame, far cheaper than the V8-side
+    serializer's 28 KB). This pins the default case, which is the one every
+    user is in, so a frame-size regression in the converter surfaces here
+    rather than as a SIGBUS in somebody's worker thread.
+
+    Raising `max_serialization_depth` past ~900 *and* converting from a small
+    thread is still fatal and is documented as such on the setting; the real
+    fix is to move the conversion onto the runtime thread, which is a
+    GIL-crossing change and not this commit's business.
+    """
+    completed = _run_child(f"""
+        import threading
+        from peno import Runtime
+
+        def deep(n):
+            obj = {{"leaf": 1}}
+            for _ in range(n):
+                obj = {{"n": obj}}
+            return obj
+
+        def body():
+            with Runtime() as rt:
+                f = rt.eval("(v) => 1")
+                for depth in ({MAX_JS_DEPTH}, 2 * {MAX_JS_DEPTH}, 400):
+                    try:
+                        f(deep(depth))
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"refused: {{type(exc).__name__}}")
+
+        # A plain threading.Thread, i.e. the 512 KB stack, not the main
+        # thread's 8 MB.
+        worker = threading.Thread(target=body)
+        worker.start()
+        worker.join()
+        print("survived")
+    """)
+    _assert_child_survived(completed)
+    assert "survived" in completed.stdout

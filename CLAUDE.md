@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-peno is a Python library providing JavaScript runtime capabilities via Rust and V8. It exposes a Python API for executing JavaScript code in isolated V8 contexts with async support and permission controls.
+peno is a Python library providing JavaScript runtime capabilities via Rust and V8. It exposes a Python API for executing JavaScript code in isolated V8 contexts, with async support and a capability-token host-function boundary. There is **no permission model** -- see "Ops System" below; a `Runtime` grants nothing by default, so what a guest can reach is exactly what a host bound.
 
 **Tech Stack:**
 - Rust (core runtime using deno_core)
@@ -95,7 +95,7 @@ make clean
 The project has three distinct layers that communicate via well-defined boundaries:
 
 1. **Rust Core** (`src/runtime/`): V8 isolate management, async execution, ops system
-2. **Rust-Python Bridge** (`src/runtime/python.rs`, `src/lib.rs`): PyO3 bindings
+2. **Rust-Python Bridge** (`src/runtime/python/`, `src/lib.rs`): PyO3 bindings
 3. **Python API** (`python/peno/__init__.py`): User-facing interface
 
 ### Type Conversion Notes
@@ -128,7 +128,16 @@ The main Python thread communicates with runtime threads via message passing (`H
 - Manages JavaScript event loop execution
 
 **Ops System** (`src/runtime/ops.rs`):
-- Permission-based host function registry
+- Capability-addressed host function registry. An op is reachable only by
+  holding its token, drawn from a CSPRNG over `1..2^53`; a registered op is
+  not callable until `expose` runs, which the bind paths do only after the
+  binding is installed in the guest's scope; `revoke` reverses both.
+- **Not permission-based.** This file said "permission-based" through 0.2.x
+  and no permission concept has ever existed in `src/` (`grep -rni permission
+  src/` -> zero hits), nor any permission field on `RuntimeConfig`. The real
+  model is tokens plus `ToolBridge` scoping (namespace + total call budget +
+  construction-time name check). See
+  `docs/contributing/architecture.md#there-is-no-permission-model-and-none-is-missing`.
 - Sync and async ops with JSON serialization
 - JavaScript calls ops via `__host_op_sync__()` and `__host_op_async__()`
 
@@ -247,7 +256,7 @@ The project uses MkDocs with Material theme for documentation:
 - `docs/concepts/`: Core concepts like runtime model and type conversion
 - `docs/use-cases/`: Real-world usage examples (playground, etc.)
 - `docs/api/`: Auto-generated API reference from docstrings
-- `docs/internals/`: Architecture deep-dives
+- `docs/contributing/architecture.md`: Architecture deep-dive (there is no `docs/internals/`)
 - `docs/stubs/`: Type stubs for mkdocstrings to generate API docs
 - `mkdocs.yml`: Site configuration
 
@@ -445,7 +454,7 @@ asyncio.run(main())
   - `stats.rs`: Runtime statistics exports
   - `snapshot.rs`: Snapshot builder bindings
 - `src/runtime/config.rs`: Configuration builder
-- `src/runtime/ops.rs`: Op registry and permissions
+- `src/runtime/ops.rs`: Op registry and capability tokens
 - `src/runtime/loader.rs`: Module loading and resolution
 - `src/runtime/inspector.rs`: Chrome DevTools protocol server
 - `src/runtime/snapshot.rs`: Snapshot creation and management
@@ -459,7 +468,7 @@ asyncio.run(main())
 
 1. **Not closing runtimes**: When using `Runtime()` explicitly, always use context manager or call `.close()`. The context-local API (`peno.eval()`) handles cleanup automatically.
 
-2. **Op permission mismatches**: Ops requiring permissions will fail if runtime not granted those permissions via `RuntimeConfig`.
+2. **Expecting a permission model**: there isn't one, and this file used to claim there was. An op is addressed by an unguessable token and is dispatchable only after a successful bind; `Runtime.revoke_op` / `ToolBridge.detach` revoke it. Do not look for a `RuntimeConfig` permission field -- the question is what you bound, not what you permitted.
 
 3. **Infinite promises**: Using `eval_async` without a timeout on a never-resolving promise blocks until something else kills it. Pass `timeout=` for untrusted code. Both escapes work on every parked shape as of 0.2.0: the job's deadline (`timeout=`) and `TerminationHandle.terminate()` from a watchdog thread, which the dispatcher now observes between polls (~1.7 ms). A runtime whose *thread* is wedged in a host callback that never returns is the one case neither reaches -- see `RuntimeConfig(force_kill_grace=...)`, which is opt-in because it costs ~10% per call.
 

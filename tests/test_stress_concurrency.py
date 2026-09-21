@@ -88,7 +88,7 @@ class TestPoolChurnDoesNotLeak:
         assert result["growth"] < MAX_GROWTH_MB, (
             f"IsolatePool leaked under churn: RSS grew {result['growth']:.1f}MB "
             f"over {CYCLES} checkout/release cycles (limit {MAX_GROWTH_MB}MB). "
-            "This is the v0.2.2 dead-context leak; see src/runtime/pool.rs."
+            "This is the pre-0.3 dead-context leak; see src/runtime/pool.rs."
         )
 
     def test_churn_on_a_single_isolate_does_not_grow_rss(self) -> None:
@@ -147,7 +147,7 @@ RUNTIME_BLOCK = 30
 class TestRuntimeChurnWithOpsDoesNotLeak:
     """The regression test the op-registry leak never had.
 
-    The v0.2.2 leak was the shared `OpRegistry` `Rc` stashed in V8 embedder
+    The pre-0.3 leak was the shared `OpRegistry` `Rc` stashed in V8 embedder
     slot 0: it had to be converted back to an `Rc` and dropped when the
     isolate went away, and it was not. The v0.2.0 review found that nothing
     covered it -- `test_rapid_checkout_release_churn_does_not_grow_rss` churns
@@ -210,7 +210,7 @@ class TestRuntimeChurnWithOpsDoesNotLeak:
         assert result["total"] < MAX_GROWTH_MB, (
             f"Runtime churn with ops leaked: peak RSS grew {result['total']:.1f}MB "
             f"over {RUNTIME_CYCLES} create/close cycles (limit {MAX_GROWTH_MB}MB). "
-            "This is the v0.2.2 embedder-slot-0 op-registry leak; see "
+            "This is the pre-0.3 embedder-slot-0 op-registry leak; see "
             "src/runtime/runner.rs."
         )
 

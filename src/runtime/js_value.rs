@@ -39,6 +39,26 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// stack limit (~1 MiB), the `deno_core`/tokio frames above the converter, and
 /// future growth in the converters themselves. It is only a *reservation*:
 /// pages are committed lazily, so an idle runtime thread does not pay for it.
+///
+/// # What this does *not* cover
+///
+/// `python_to_js_value` recurses on the thread that **called** -- it needs
+/// that thread's GIL and its Python objects -- so this reservation is
+/// irrelevant to it. A `threading.Thread` gets 512 KB on macOS and `peno`
+/// cannot set the stack of a thread it did not spawn.
+///
+/// Measured (debug, macOS arm64, 512 KB caller thread): a nested-dict
+/// argument converts safely to depth **900** and dies with SIGBUS at
+/// **1000**, i.e. ~512 bytes per frame -- 55x cheaper than the V8-side
+/// serializer, because these frames carry `Bound<PyAny>` handles rather than
+/// V8 scopes. Against the default [`MAX_JS_DEPTH`] of 100 that is ~9x of
+/// headroom, which is why the default configuration is safe from any thread;
+/// `tests/test_thread_stack_size.py` pins it.
+///
+/// It is *not* safe to raise `max_serialization_depth` past ~900 and then
+/// convert from a small-stack thread. Closing that properly means moving the
+/// Python->JS conversion onto the runtime thread, which changes where the GIL
+/// is held across the boundary and is a bigger change than a constant.
 pub const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Configurable serialization limits applied during Python<->JS transfers.

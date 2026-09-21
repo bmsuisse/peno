@@ -24,15 +24,18 @@ Run untrusted, LLM-generated JavaScript safely in Python — real V8, real isola
   <a href="https://github.com/bmsuisse/peno/issues"><strong>Issues</strong></a>
 </p>
 
-**16-18x faster repeat execution via context-isolated isolate pooling** —
-~3&nbsp;ms cold `Runtime()` start vs. ~167-185&nbsp;µs per pooled
-`IsolatePool` checkout+eval, measured with Criterion and pytest-benchmark,
-with a dedicated test proving no state leaks between checkouts. Proven, not
-claimed — see [`BENCHMARKS.md`](BENCHMARKS.md).
+**Retain one `Runtime` per session.** A warm `Runtime` does a *complete*
+host tool call — JS calls a bound Python function, the op crosses the
+boundary, a value comes back — in **~13.4&nbsp;µs**, and ~3.8&nbsp;µs for a
+bare `eval`. That is the fast path, and it is the one that supports tool
+calling.
 
-For tool-calling workloads, **retain one `Runtime` per session instead**: a
-warm `Runtime` does a full host tool call in ~13.4&nbsp;µs — ~12x faster than
-a pool checkout, which cannot host tool calls at all. See
+`IsolatePool` is **~167-185&nbsp;µs** per checkout+eval and **cannot host a
+tool call at all**; what it buys is a *guaranteed-fresh context per call*,
+which is ~16x cheaper than constructing a new `Runtime` (~3&nbsp;ms) for the
+stateless, mutually-untrusting, one-eval-each case. Pick it for that property,
+not for speed. Measured with Criterion and pytest-benchmark — proven, not
+claimed: see [`BENCHMARKS.md`](BENCHMARKS.md) and
 [`docs/tool-calling-at-pool-speed.md`](docs/tool-calling-at-pool-speed.md).
 
 </div>
@@ -70,7 +73,7 @@ print(peno.eval("add(2, 3)"))  # 5
   design that meant a stuck agent tool call couldn't be killed from outside.
   `TerminationHandle` fixes this: it exposes only the `Send + Sync` part of
   V8's isolate handle, so a watchdog on a separate thread can interrupt
-  execution safely. See [`PATCH.md`](PATCH.md) for the full root cause and
+  execution safely. See [`upstream-divergence.md`](docs/contributing/upstream-divergence.md) for the full root cause and
   proof; `tests/test_termination_handle.py` is the regression test.
 
   As of 0.2.0 this works on *every* shape of stuck script, not just runaway
@@ -89,7 +92,10 @@ print(peno.eval("add(2, 3)"))  # 5
   ever survives from one caller to the next, even when they land on the same
   underlying isolate. Measured: **~3 ms cold-start &rarr; ~170-185 µs pooled,
   ~16-18x**, with a dedicated test proving a `globalThis` value set in one
-  checkout is gone (`typeof x === 'undefined'`) in the next. See
+  checkout is gone (`typeof x === 'undefined'`) in the next. That 16-18x is
+  against *constructing* a runtime per call, not against retaining one — a
+  warm `Runtime` is ~14x cheaper still and can host tool calls, so the pool is
+  for the fresh-context requirement rather than for throughput. See
   [`BENCHMARKS.md`](BENCHMARKS.md) and `src/runtime/pool.rs` for the numbers
   and the reasoning.
 - **A host-callback bridge for tool-calling from JS.** `bind_function`/
@@ -157,7 +163,8 @@ Running an untrusted sync `eval()` you can't await? Grab a
 [`TerminationHandle`](https://bmsuisse.github.io/peno/api/runtime/)
 before the call and `.terminate()` it from a watchdog thread — see
 [`tests/test_termination_handle.py`](tests/test_termination_handle.py) for
-the exact pattern (and the bug it fixed, in [`PATCH.md`](PATCH.md)).
+the exact pattern (and the bug it fixed, in
+[`docs/contributing/upstream-divergence.md`](docs/contributing/upstream-divergence.md)).
 
 ### Many tools, one budget
 
@@ -184,10 +191,12 @@ architectural boundary, not a todo — see the
 [bindings guide](https://bmsuisse.github.io/peno/guides/bindings/) for
 why.
 
-For a fast path when you're running many short-lived, independent snippets
-(e.g. one per agent turn) and don't need `bind_function`/modules for that
-particular call, check out an isolate from a warm `IsolatePool` instead of
-paying full cold-start cost each time:
+### A fresh context per call, when that is the requirement
+
+`IsolatePool` hands out an isolate whose globals start empty every time, at
+~195 µs per checkout instead of the ~3 ms a new `Runtime` costs. The isolation
+is verified, not asserted: set `globalThis.__leak` in one checkout and it is
+`undefined` in the next (`tests/test_isolate_pool.py`).
 
 ```python
 from peno import IsolatePool
@@ -196,6 +205,15 @@ pool = IsolatePool(size=4)
 with pool.checkout() as isolate:
     print(isolate.eval("1 + 41"))  # 42
 ```
+
+**This is not the fast path, and it is not a general-purpose alternative to
+`Runtime`.** A `PooledIsolate` exposes `eval` and `release` and nothing else —
+no `bind_function`, no `register_op`, no `eval_async`, no modules, no
+`ToolBridge` — because a pooled isolate has no op registry behind it. And a
+retained `Runtime` does a *full host tool call* in ~13.4 µs, roughly **14x
+faster** than a bare `eval` on a pooled isolate. So reach for the pool when
+"this snippet must not see the last one's globals" is a hard requirement and
+ops are not needed; otherwise keep a `Runtime` warm.
 
 ## Integrations
 
