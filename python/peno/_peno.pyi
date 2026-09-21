@@ -669,7 +669,14 @@ class Runtime:
             mode: Operation mode ("sync" or "async")
 
         Returns:
-            Operation ID that can be used in JavaScript
+            An unguessable **capability token** for the op, usable from
+            JavaScript as ``__host_op_sync__(token, ...)`` /
+            ``__host_op_async__(token, ...)``. The token is drawn from a
+            CSPRNG and knowing it *is* the authority to call the op: nothing
+            else reaches the handler, so do not hand it to guest code you do
+            not intend to grant the capability to. (Before v0.2.1 ids were
+            sequential from zero and any registered id was callable, which
+            made the registry ambient.) Revoke it with :meth:`revoke_op`.
 
         Raises:
             RuntimeError: If registration fails
@@ -688,6 +695,25 @@ class Runtime:
             >>> op_id = runtime.register_op("add", add_handler, mode="sync")
             >>> # From JavaScript: __host_op_sync__(op_id, 10, 20)  # Returns 30
             ```
+        """
+        ...
+
+    def revoke_op(self, op_id: int) -> bool:
+        """
+        Revoke an op capability.
+
+        Drops the handler and its dispatch entry, so the token stops working
+        even for guest code that already captured the bound function. The
+        global name installed by :meth:`bind_function` / :meth:`bind_object`
+        remains, but calling it raises.
+
+        Args:
+            op_id: A token returned by :meth:`register_op`,
+                :meth:`bind_function` or :meth:`bind_object`.
+
+        Returns:
+            True if a live capability was revoked, False if the token was
+            already unknown (revoking twice is a no-op, not an error).
         """
         ...
 
@@ -767,13 +793,16 @@ class Runtime:
         self,
         name: str,
         handler: Callable[..., Any],
-    ) -> None:
+    ) -> int:
         """
         Expose a Python handler as a global JavaScript function.
 
         Args:
             name: Global function name (assigned on `globalThis`)
             handler: Python callable invoked when JS calls the function
+
+        Returns:
+            The op's capability token, for :meth:`revoke_op`.
 
         Note:
             If ``handler`` is async, the runtime must first establish asyncio
@@ -819,7 +848,7 @@ class Runtime:
         """Return a decorator for binding sync or async callables to ``globalThis``."""
         ...
 
-    def bind_object(self, name: str, obj: Mapping[str, Any]) -> None:
+    def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
         """
         Expose a Python mapping as a global JavaScript object.
 
@@ -831,6 +860,10 @@ class Runtime:
             name: Object name assigned on ``globalThis``
             obj: Mapping with string keys and JSON-serializable values or
                 callables
+
+        Returns:
+            The capability token of each callable key, for :meth:`revoke_op`.
+            Non-callable keys are absent.
 
         Example:
             ```python

@@ -369,9 +369,53 @@ Other semantics worth knowing:
   over the serialization limits), the bridge retries with the arguments
   stringified, and drops the message entirely rather than throwing if even
   that fails. A callback that raises is likewise swallowed.
-- JS functions serialize as `{}`, and `null`/`undefined` both arrive as the
-  [`undefined`][peno.undefined] sentinel, as everywhere else on the
-  host-callback path.
+- Passing a JS function (or a `Symbol`) to a host tool is **refused** with a
+  `TypeError` naming the argument path -- it does not arrive as `{}`. See
+  [Capabilities and revocation](#capabilities-and-revocation).
+- `null`/`undefined` both arrive as the [`undefined`][peno.undefined]
+  sentinel, as everywhere else on the host-callback path.
+
+## Capabilities and revocation
+
+`bind_function` returns an **op capability token**, `bind_object` returns one
+per callable key, and `register_op` returns the token for the op it created.
+The token is an unguessable integer drawn from a CSPRNG, and it is the whole
+authority to call that op: guest JS reaches a host handler only through a
+token a completed bind step installed in its scope.
+
+That matters for two reasons:
+
+- **Do not hand a token to guest code you do not mean to grant the
+  capability to.** The name is convenience; the token is authority.
+- **A namespace is not a trust boundary by itself, but a token is.** Two
+  `ToolBridge`es with different trust levels on one `Runtime` no longer
+  collapse into one trust level, because neither can address the other's ops.
+
+Revoke with [`revoke_op`][peno.Runtime.revoke_op], or
+[`ToolBridge.detach`][peno.ToolBridge.detach] for a whole bridge:
+
+```python
+token = runtime.bind_function("dangerous", do_something)
+runtime.eval("dangerous()")      # works
+runtime.revoke_op(token)
+runtime.eval("dangerous()")      # raises: the capability is gone
+```
+
+The global name stays on `globalThis` -- a guest may have captured the
+function reference already anyway -- but the capability behind it is dropped,
+so the call fails.
+
+A guest-visible failure to reach an op is always the same, name-free
+`Unknown host op`, whether the token is unknown, was never exposed, or was
+revoked. That is deliberate: distinguishing them would let a guest enumerate
+what a runtime has registered.
+
+Passing a JS function to a host tool raises rather than silently arriving as
+`{}`. Supporting it properly means a host-held reference with a documented
+lifetime (ownership, release, behaviour after the supplying call returned),
+which is a feature rather than a conversion detail. If a tool needs a
+callback shape, have it return a value and let the guest apply its own
+function to it.
 
 ## `ToolBridge`: many tools, with a budget
 

@@ -249,7 +249,10 @@ class TestOpHandlers:
                 """
             )
 
-            assert "async" in result
+            # Name-free by design: a guest looping over ids must not be able
+            # to harvest the names of host tools it was never given.
+            assert result == "Host op is not synchronous", result
+            assert "asyncOnly" not in result
         finally:
             runtime.close()
 

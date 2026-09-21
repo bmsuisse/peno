@@ -204,7 +204,7 @@ async def eval_async(code: str, **kwargs) -> Any:
     return await get_default_runtime().eval_async(code, **kwargs)
 
 
-def bind_function(name: str, handler: Callable[..., Any]) -> None:
+def bind_function(name: str, handler: Callable[..., Any]) -> int:
     """Bind a Python function to the default context-local runtime.
 
     The function will be available as a global in JavaScript. Both sync and async
@@ -214,21 +214,28 @@ def bind_function(name: str, handler: Callable[..., Any]) -> None:
         name: The name to bind in JavaScript globalThis.
         handler: The Python callable to bind (sync or async).
 
+    Returns:
+        The op's capability token, for :meth:`Runtime.revoke_op`.
+
     Example:
         >>> import peno
         >>> peno.bind_function("add", lambda a, b: a + b)
         >>> peno.eval("add(2, 3)")
         5
     """
-    get_default_runtime().bind_function(name, handler)
+    return get_default_runtime().bind_function(name, handler)
 
 
-def bind_object(name: str, obj: dict) -> None:
+def bind_object(name: str, obj: dict) -> dict[str, int]:
     """Bind a Python dict as a JavaScript object in the default context-local runtime.
 
     Args:
         name: The name to bind in JavaScript globalThis.
         obj: The Python dict to expose as a JavaScript object.
+
+    Returns:
+        The capability token of each callable key, for
+        :meth:`Runtime.revoke_op`.
 
     Example:
         >>> import peno
@@ -236,7 +243,7 @@ def bind_object(name: str, obj: dict) -> None:
         >>> peno.eval("config.version")
         '1.0'
     """
-    get_default_runtime().bind_object(name, obj)
+    return get_default_runtime().bind_object(name, obj)
 
 
 __all__ = [

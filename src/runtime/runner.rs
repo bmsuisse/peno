@@ -15,7 +15,7 @@ use crate::runtime::js_value::{
     JSValue, LimitTracker, SerializationLimits, RUNTIME_THREAD_STACK_SIZE,
 };
 use crate::runtime::loader::PythonModuleLoader;
-use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
+use crate::runtime::ops::{python_extension, OpToken, PythonOpMode, PythonOpRegistry};
 use crate::runtime::stats::{
     ActivitySummary, HeapSnapshot, RuntimeCallKind, RuntimeStatsSnapshot, RuntimeStatsState,
 };
@@ -351,7 +351,12 @@ pub enum RuntimeCommand {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
-        responder: Sender<RuntimeResult<u32>>,
+        responder: Sender<RuntimeResult<OpToken>>,
+    },
+    SetPythonOpExposure {
+        op_id: OpToken,
+        exposed: bool,
+        responder: Sender<RuntimeResult<bool>>,
     },
     SetModuleResolver {
         handler: Py<PyAny>,
@@ -846,6 +851,19 @@ impl RuntimeDispatcher {
                     Err(self.core.terminated_error())
                 } else {
                     self.core.register_python_op(name, mode, handler)
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::SetPythonOpExposure {
+                op_id,
+                exposed,
+                responder,
+            } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(self.core.terminated_error())
+                } else {
+                    Ok(self.core.set_python_op_exposure(op_id, exposed))
                 };
                 let _ = responder.send(result);
                 false
@@ -2308,6 +2326,11 @@ impl RuntimeCoreState {
                 PythonOpMode::Sync,
                 callback.0,
             );
+            // The console shim below closes over the token, so exposing it
+            // here is the bind step for this capability. The token is
+            // unguessable and never a readable property, so guest JS cannot
+            // forge console output through it.
+            registry.expose(op_id);
             let passthrough = enable_console == Some(true);
             js_runtime
                 .execute_script(
@@ -2701,8 +2724,17 @@ impl RuntimeCoreState {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
-    ) -> RuntimeResult<u32> {
+    ) -> RuntimeResult<OpToken> {
         Ok(self.registry.register(name, mode, handler))
+    }
+
+    /// Expose (`true`) or revoke (`false`) one op capability.
+    fn set_python_op_exposure(&self, op_id: OpToken, exposed: bool) -> bool {
+        if exposed {
+            self.registry.expose(op_id)
+        } else {
+            self.registry.revoke(op_id)
+        }
     }
 
     fn bind_object(
@@ -2710,6 +2742,7 @@ impl RuntimeCoreState {
         name: String,
         properties: Vec<BoundObjectProperty>,
     ) -> RuntimeResult<()> {
+        let registry = self.registry.clone();
         deno_core::scope!(scope, self.js_runtime);
         v8::tc_scope!(let try_catch, scope);
         let context = try_catch.get_current_context();
@@ -2727,6 +2760,7 @@ impl RuntimeCoreState {
             .ok_or_else(|| RuntimeError::internal("Failed to allocate target name"))?;
 
         let assignments = v8::Array::new(try_catch, properties.len() as i32);
+        let mut op_tokens: Vec<OpToken> = Vec::new();
 
         for (index, entry) in properties.into_iter().enumerate() {
             let entry_obj = v8::Object::new(try_catch);
@@ -2770,6 +2804,7 @@ impl RuntimeCoreState {
                     op_id,
                     mode,
                 } => {
+                    op_tokens.push(op_id);
                     let kind_value = v8::String::new(try_catch, "op")
                         .ok_or_else(|| RuntimeError::internal("Failed to allocate kind value"))?;
                     entry_obj
@@ -2811,7 +2846,16 @@ impl RuntimeCoreState {
             global.into(),
             &[global_name.into(), assignments.into()],
         ) {
-            Some(_) => Ok(()),
+            Some(_) => {
+                // Exposure happens here, not at registration: the capability
+                // becomes dispatchable only once the binding it belongs to is
+                // actually installed in the guest's scope. A `__peno_bind_object`
+                // that threw leaves the handlers registered but unreachable.
+                for token in op_tokens {
+                    registry.expose(token);
+                }
+                Ok(())
+            }
             None => {
                 if let Some(exception) = try_catch.exception() {
                     let js_error = JsError::from_v8_exception(try_catch, exception);

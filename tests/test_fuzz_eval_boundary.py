@@ -271,19 +271,80 @@ class TestAdversarialSource:
         _eval_must_not_crash(f"try {{ JSON.parse('{encoded}') }} catch (e) {{ 0 }}")
 
 
+def _escape_js_string(text: str) -> str:
+    """Escape Python text so it is a valid single-quoted JS string literal."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace(" ", "\\u2028")
+        .replace(" ", "\\u2029")
+    )
+
+
+# JS *value* source text, recursively nested: objects, arrays, Date, Set,
+# BigInt, typed arrays, the special floats, and -- crucially -- a large-string
+# leaf, so `max_serialization_bytes` is reachable from the fuzzer at all.
+#
+# The previous version of this strategy generated arbitrary *text* and
+# interpolated it into a single string literal (`sink('{escaped}')`), so every
+# example passed exactly one JS string: no object, array, Date, Set, BigInt or
+# typed array ever reached the tool. It fuzzed source-text escaping, one layer
+# down from the marshaling boundary its name claimed.
+js_value_source = st.recursive(
+    st.one_of(
+        st.just("null"),
+        st.just("undefined"),
+        st.booleans().map(lambda b: "true" if b else "false"),
+        st.sampled_from(["NaN", "Infinity", "-Infinity", "-0", "0"]),
+        st.integers(min_value=-(2**53) + 1, max_value=2**53 - 1).map(repr),
+        st.floats(allow_nan=False, allow_infinity=False, width=64).map(repr),
+        st.integers(min_value=-(2**80), max_value=2**80).map(lambda i: f"{i}n"),
+        st.text(max_size=48).map(lambda t: "'" + _escape_js_string(t) + "'"),
+        st.integers(min_value=0, max_value=200_000).map(lambda n: f"'x'.repeat({n})"),
+        st.lists(st.integers(min_value=0, max_value=255), max_size=16).map(
+            lambda xs: f"new Uint8Array({list(xs)!r})"
+        ),
+        st.integers(min_value=0, max_value=2_000_000_000_000).map(
+            lambda ms: f"new Date({ms})"
+        ),
+    ),
+    lambda children: st.one_of(
+        st.lists(children, max_size=6).map(lambda xs: "[" + ",".join(xs) + "]"),
+        st.lists(children, max_size=6).map(
+            lambda xs: "new Set([" + ",".join(xs) + "])"
+        ),
+        st.lists(children, max_size=6).map(
+            lambda xs: "({" + ",".join(f"k{i}: {x}" for i, x in enumerate(xs)) + "})"
+        ),
+    ),
+    max_leaves=12,
+)
+
+
 class TestAdversarialHostCallArguments:
     """Fuzz the *argument* direction: JS handing junk to a Python tool."""
 
-    @given(code=st.text(max_size=120))
+    @given(source=js_value_source)
     @FUZZ
-    def test_a_tool_called_with_arbitrary_generated_js_values(self, code: str) -> None:
-        escaped = code.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+    def test_a_tool_called_with_arbitrary_generated_js_values(
+        self, source: str
+    ) -> None:
+        """Genuinely varied JS *values* -- not one string literal -- reaching a
+        host tool. The invariant is the sandbox promise: a value or a catchable
+        exception, never a crash; and if it was accepted, it actually arrived."""
         with Runtime(TIMEOUT_CONFIG) as rt:
-            rt.bind_function("sink", lambda *a: len(a))
+            received: list[object] = []
+            rt.bind_function("sink", lambda v: received.append(v) or "ok")
             try:
-                rt.eval(f"try {{ sink('{escaped}') }} catch (e) {{ 0 }}")
+                out = rt.eval(f"sink({source})")
             except (JavaScriptError, RuntimeError, ValueError):
-                pass
+                return
+            # An accepted call must have reached Python with a value, rather
+            # than being silently dropped or replaced by a placeholder.
+            assert out == "ok"
+            assert len(received) == 1
 
     @given(count=st.integers(min_value=0, max_value=400))
     @FUZZ
@@ -296,20 +357,128 @@ class TestAdversarialHostCallArguments:
                 return
             assert got == count
 
+    # `max_serialization_depth` for the depth tests below. Small enough that
+    # hypothesis reaches both sides of it on nearly every example, and well
+    # under `serde_v8`'s own internal recursion limit so the knob under test
+    # is the one that does the refusing.
+    DEPTH_LIMIT = 12
+
     @given(depth=st.integers(min_value=1, max_value=400))
     @FUZZ
     def test_a_tool_called_with_a_deeply_nested_object(self, depth: int) -> None:
-        """Past max_serialization_depth this must be refused cleanly, not
-        recurse the Rust stack into a segfault."""
-        with Runtime(TIMEOUT_CONFIG) as rt:
+        """Past `max_serialization_depth` this must be refused, and inside it
+        accepted -- exactly, not "either outcome is fine".
+
+        The previous version caught `(JavaScriptError, RuntimeError,
+        ValueError)` and asserted **nothing**, so it passed identically with
+        the depth limit removed. That is how the v0.2.0 review's finding M3b --
+        the configured depth limit being ignored inbound entirely -- survived a
+        test written to catch it.
+
+        Accounting: a value nested `depth` levels consumes `depth + 1` tracker
+        levels, because the scalar leaf counts as one.
+        """
+        config = RuntimeConfig(max_serialization_depth=self.DEPTH_LIMIT, timeout=2.0)
+        with Runtime(config) as rt:
             rt.bind_function("sink", lambda v: True)
             script = (
                 f"let v = 1; for (let i = 0; i < {depth}; i++) v = {{n: v}}; sink(v)"
             )
             try:
                 rt.eval(script)
+                accepted = True
             except (JavaScriptError, RuntimeError, ValueError):
-                pass
+                accepted = False
+
+        assert accepted == (depth + 1 <= self.DEPTH_LIMIT), (
+            f"op argument nested {depth} deep was "
+            f"{'accepted' if accepted else 'refused'} against "
+            f"max_serialization_depth={self.DEPTH_LIMIT}"
+        )
+
+    @given(depth=st.integers(min_value=1, max_value=400))
+    @FUZZ
+    def test_the_depth_limit_is_the_same_in_both_directions(self, depth: int) -> None:
+        """The same payload, the same configured limit: an `eval` result and an
+        op argument must agree.
+
+        This is the asymmetry assertion. Before the fix the identical value was
+        refused as a result and accepted as an argument -- so the limit bound
+        the trusted party and not the untrusted one.
+        """
+        config = RuntimeConfig(max_serialization_depth=self.DEPTH_LIMIT, timeout=2.0)
+        build = f"let v = 1; for (let i = 0; i < {depth}; i++) v = {{n: v}}; "
+
+        def accepts(script: str) -> bool:
+            with Runtime(config) as rt:
+                rt.bind_function("sink", lambda v: True)
+                try:
+                    rt.eval(script)
+                    return True
+                except (JavaScriptError, RuntimeError, ValueError):
+                    return False
+
+        inbound = accepts(build + "sink(v)")
+        outbound = accepts(build + "v")
+        assert inbound == outbound, (
+            f"depth {depth} against max_serialization_depth={self.DEPTH_LIMIT}: "
+            f"inbound accepted={inbound}, outbound accepted={outbound}"
+        )
+
+    # `max_serialization_bytes` for the size tests. The margin keeps the
+    # assertion robust against the small per-value bookkeeping overhead the
+    # tracker adds on top of raw payload length.
+    BYTE_LIMIT = 1 << 20
+    BYTE_MARGIN = 4096
+
+    @given(size=st.integers(min_value=0, max_value=4 << 20))
+    @FUZZ
+    def test_a_tool_called_with_a_large_argument(self, size: int) -> None:
+        """`max_serialization_bytes` must bind on the inbound direction.
+
+        No strategy in this file used to generate a *large* argument at all, so
+        the byte budget was outside the fuzzer's reach and finding M3a -- 37.7 MB
+        accepted in one call against a 10 MB cap -- was unreachable from here.
+        """
+        if abs(size - self.BYTE_LIMIT) < self.BYTE_MARGIN:
+            return  # too close to the boundary to assert either way
+        config = RuntimeConfig(max_serialization_bytes=self.BYTE_LIMIT, timeout=5.0)
+        with Runtime(config) as rt:
+            rt.bind_function("sink", lambda v: len(v))
+            try:
+                got = rt.eval(f"sink('x'.repeat({size}))")
+                accepted = True
+            except (JavaScriptError, RuntimeError, ValueError):
+                accepted = False
+                got = None
+
+        assert accepted == (size < self.BYTE_LIMIT), (
+            f"a {size}-byte argument was {'accepted' if accepted else 'refused'} "
+            f"against max_serialization_bytes={self.BYTE_LIMIT}"
+        )
+        if accepted:
+            assert got == size
+
+    @given(count=st.integers(min_value=2, max_value=6))
+    @FUZZ
+    def test_the_inbound_byte_budget_is_aggregate_not_per_argument(
+        self, count: int
+    ) -> None:
+        """N arguments each under the limit must not together exceed it.
+
+        The mirror of `TestSerializationBudgetIsAggregate` in
+        test_gil_and_limits.py, which covered only the Python->JS half -- which
+        is how the JS->Python half stayed broken through v0.2.0.
+        """
+        each = (self.BYTE_LIMIT * 3) // 4  # comfortably under on its own
+        config = RuntimeConfig(max_serialization_bytes=self.BYTE_LIMIT, timeout=5.0)
+        with Runtime(config) as rt:
+            rt.bind_function("sink", lambda *a: sum(len(x) for x in a))
+            # One argument of this size is fine ...
+            assert rt.eval(f"sink('x'.repeat({each}))") == each
+            # ... but `count` of them are not, because the budget is the call's.
+            with pytest.raises((JavaScriptError, RuntimeError, ValueError)):
+                rt.eval(f"sink(...Array({count}).fill('x'.repeat({each})))")
 
     @given(
         exc_name=st.sampled_from(
@@ -323,16 +492,17 @@ class TestAdversarialHostCallArguments:
     ) -> None:
         """The typed-error path must hold for arbitrary messages -- including
         ones containing the ': ' separator or the U+0001 marker itself."""
-        exc_type = (
-            getattr(__builtins__, exc_name, None)
-            or {
-                "ValueError": ValueError,
-                "KeyError": KeyError,
-                "RuntimeError": RuntimeError,
-                "TypeError": TypeError,
-                "OSError": OSError,
-            }[exc_name]
-        )
+        # A module-level `__builtins__` is a dict, not a module, so the
+        # `getattr(__builtins__, ...)` this used to try was always dead and
+        # the mapping below was always what ran. A silently-dead branch in a
+        # test is indistinguishable from a working one, so it is gone.
+        exc_type = {
+            "ValueError": ValueError,
+            "KeyError": KeyError,
+            "RuntimeError": RuntimeError,
+            "TypeError": TypeError,
+            "OSError": OSError,
+        }[exc_name]
 
         def failing() -> None:
             raise exc_type(message)
@@ -350,7 +520,15 @@ class TestAdversarialHostCallArguments:
 
 class TestPoolFuzz:
     """The pooled fast path has its own compiler entry point (a bare
-    `v8::Script::compile`, not deno_core), so it needs its own fuzzing."""
+    `v8::Script::compile`, not deno_core), so it needs its own fuzzing.
+
+    These tests deliberately assert nothing beyond "the process survived":
+    the invariant under test is crash-freedom for arbitrary input, and
+    `_eval_must_not_crash`-style bodies express exactly that. Elsewhere in
+    this file an assertion-free body is a bug (see
+    `test_a_tool_called_with_a_deeply_nested_object`); here it is the point,
+    which is why it is called out rather than left to the reader.
+    """
 
     @given(code=st.text(max_size=300))
     @FUZZ
@@ -449,6 +627,56 @@ class TestKnownConversionResiduals:
         with Runtime() as rt:
             rt.bind_object("cfg", {"__proto__": {"isAdmin": True}, "ok": 2})
             assert rt.eval("cfg.isAdmin") is undefined
+
+    def test_a_js_function_argument_is_refused_not_silently_emptied(self) -> None:
+        """Regression test for the v0.2.0 review's finding M4.
+
+        A JS function handed to a host tool used to arrive as `{}` -- bare or
+        nested -- with no error, because `serde_v8` sees a function as an
+        object with no own enumerable properties and `JSValue`'s hand-written
+        `Deserialize` has no function arm. A tool expecting `onProgress`, a
+        comparator or a continuation got an empty options object and failed
+        somewhere unrelated, or silently carried on.
+
+        The fix refuses it, naming the argument path, rather than registering
+        the function and handing the tool a live `JsFunction`: a held
+        reference needs a documented lifetime (who owns it, when it is
+        released, what it does after the supplying call returned), and that is
+        a feature to design, not a bug fix. An error is recoverable; `{}` is
+        not detectable.
+        """
+        received: list[object] = []
+        with Runtime() as rt:
+            rt.bind_function("take", lambda cb: received.append(cb) or "stored")
+
+            for payload, path in [
+                ("take(function(){return 7})", "args[0]"),
+                ("take(() => 1)", "args[0]"),
+                ("take({cb: () => 1})", "args[0].cb"),
+                ("take([[() => 1]])", "args[0][0][0]"),
+                ("take(new Set([() => 1]))", "args[0].<set item 0>"),
+            ]:
+                with pytest.raises(JavaScriptError) as caught:
+                    rt.eval(payload)
+                message = str(caught.value)
+                assert "Cannot pass a JavaScript function" in message, message
+                assert path in message, f"{path!r} not named in {message}"
+
+        assert received == [], f"a function still reached the host: {received!r}"
+
+    def test_a_js_symbol_argument_is_refused_rather_than_aborting(self) -> None:
+        """`serde_v8` panics on a Symbol ("unknown ValueType for v8::Value"),
+        and a panic inside the op aborts the *host process* -- which guest JS
+        must never be able to cause. Refused in the bridge instead, where it
+        is an ordinary catchable JS error.
+        """
+        with Runtime() as rt:
+            rt.bind_function("take", lambda v: "stored")
+            for payload in ("take(Symbol('s'))", "take({s: Symbol.iterator})"):
+                with pytest.raises(JavaScriptError, match="Symbol"):
+                    rt.eval(payload)
+            # The runtime is still usable, i.e. nothing was torn down.
+            assert rt.eval("take('ok')") == "stored"
 
     def test_a_lone_surrogate_is_refused_cleanly(self) -> None:
         """Not encodable text; a clean Python exception is the right answer.

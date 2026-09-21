@@ -58,11 +58,11 @@ async def eval_async(code: str, **kwargs: Any) -> Any:
     ...
 
 
-def bind_function(name: str, handler: Callable[..., Any]) -> None:
+def bind_function(name: str, handler: Callable[..., Any]) -> int:
     """Expose a Python callable on ``globalThis``."""
     ...
 
 
-def bind_object(name: str, obj: Mapping[str, Any]) -> None:
+def bind_object(name: str, obj: Mapping[str, Any]) -> dict[str, int]:
     """Expose a Python mapping as a JavaScript object."""
     ...

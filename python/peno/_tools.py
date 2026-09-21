@@ -101,6 +101,21 @@ class ToolBridge:
         ...     rt.eval("try { tools.lookup('x') } catch (e) { e.name }")
         'ToolNotFoundError'
 
+    **The budget and the name check are load-bearing, not decorative.** The
+    only thing a guest can invoke is the capability token the bind step
+    installed, and what that token resolves to is the budgeted shim
+    (:meth:`_wrap`) -- so every call is charged, and a name this bridge
+    refused was never registered in the first place. That was not true before
+    v0.2.1: op ids were sequential integers and dispatch resolved any
+    registered id, so `__host_op_sync__(0, ...)` reached tools the guest had
+    never been given, two bridges with different trust levels on one
+    ``Runtime`` were one trust level, and the namespace was naming rather than
+    isolation. Op ids are now unguessable tokens drawn from a CSPRNG and
+    dispatch is gated on what a completed bind actually exposed; see the
+    module docs in ``src/runtime/ops.rs``.
+
+    Use :meth:`detach` to revoke everything this bridge installed.
+
     **ToolBridge requires a full `Runtime`. It cannot be used with
     `IsolatePool`, and this is permanent, not a todo.** Pooled isolates
     drive a bare ``v8::Isolate`` with no ``deno_core::JsRuntime`` behind it
@@ -116,7 +131,14 @@ class ToolBridge:
     when it needs only fast, self-contained ``eval``.
     """
 
-    __slots__ = ("_tools", "_namespace", "_max_calls", "_on_exhausted", "_calls")
+    __slots__ = (
+        "_tools",
+        "_namespace",
+        "_max_calls",
+        "_on_exhausted",
+        "_calls",
+        "_tokens",
+    )
 
     def __init__(
         self,
@@ -152,6 +174,7 @@ class ToolBridge:
         self._max_calls = max_calls
         self._on_exhausted = on_exhausted
         self._calls = 0
+        self._tokens: list[int] = []
 
     # ------------------------------------------------------------------ names
 
@@ -256,11 +279,30 @@ class ToolBridge:
 
         wrapped = {name: self._wrap(name, func) for name, func in self._tools.items()}
 
+        # Keep the capability tokens so `detach` can revoke them. Nothing
+        # reads them out of here and hands them to JS; they are the host's.
         if self._namespace is None:
             for name, shim in wrapped.items():
-                runtime.bind_function(name, shim)
+                self._tokens.append(runtime.bind_function(name, shim))
         else:
-            runtime.bind_object(self._namespace, wrapped)
+            tokens = runtime.bind_object(self._namespace, wrapped)
+            self._tokens.extend(tokens.values())
+
+    def detach(self, runtime: Any) -> int:
+        """Revoke every capability this bridge installed into `runtime`.
+
+        The bound names stay on the global object -- a guest may already have
+        captured the function references anyway -- but the capability behind
+        each one is gone, so calling them raises. That is the part that
+        matters: a name is not authority, the token is.
+
+        Returns:
+            The number of capabilities actually revoked.
+        """
+        self._reject_non_runtime(runtime)
+        revoked = sum(1 for token in self._tokens if runtime.revoke_op(token))
+        self._tokens.clear()
+        return revoked
 
     @staticmethod
     def _reject_non_runtime(runtime: object) -> None:

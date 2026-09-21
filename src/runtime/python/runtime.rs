@@ -6,7 +6,7 @@ use crate::runtime::conversion::{
 };
 use crate::runtime::handle::{BoundObjectProperty, RuntimeHandle};
 use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
-use crate::runtime::ops::PythonOpMode;
+use crate::runtime::ops::{OpToken, PythonOpMode};
 use crate::runtime::runner::{FunctionCallResult, TerminationController};
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
@@ -268,7 +268,7 @@ impl Runtime {
         name: String,
         handler: Py<PyAny>,
         mode: &str,
-    ) -> PyResult<u32> {
+    ) -> PyResult<OpToken> {
         let handle = self
             .handle
             .borrow()
@@ -279,13 +279,37 @@ impl Runtime {
         let handler_clone = handler.clone_ref(py);
         let mode_enum = Self::checked_mode(py, mode, &handler_clone)?;
 
-        handle
+        let op_id = handle
             .register_op(name, mode_enum, handler_clone)
-            .map_err(|e| runtime_error_with_context("Op registration failed", e))
+            .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
+
+        // `register_op`'s whole contract is "here is a token guest JS can
+        // call", so handing the token to the caller *is* the bind step.
+        handle
+            .set_op_exposure(op_id, true)
+            .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
+
+        Ok(op_id)
+    }
+
+    /// Revoke an op capability, by the token `register_op`/`bind_function`
+    /// returned.
+    #[pyo3(signature = (op_id))]
+    fn revoke_op(&self, _py: Python<'_>, op_id: OpToken) -> PyResult<bool> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+
+        handle
+            .set_op_exposure(op_id, false)
+            .map_err(|e| runtime_error_with_context("Op revocation failed", e))
     }
 
     #[pyo3(signature = (name, handler))]
-    fn bind_function(&self, py: Python<'_>, name: String, handler: Py<PyAny>) -> PyResult<()> {
+    fn bind_function(&self, py: Python<'_>, name: String, handler: Py<PyAny>) -> PyResult<OpToken> {
         let handle = self
             .handle
             .borrow()
@@ -318,8 +342,13 @@ impl Runtime {
         );
 
         // Execute the binding script; ignore the return value ("undefined").
+        // Expose only afterwards: if the binding script fails, the handler
+        // stays registered but is not dispatchable from guest JS.
         let _ = self.eval(py, script.as_str())?;
-        Ok(())
+        handle
+            .set_op_exposure(op_id, true)
+            .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
+        Ok(op_id)
     }
 
     #[pyo3(signature = (iterable))]
@@ -339,7 +368,12 @@ impl Runtime {
     }
 
     #[pyo3(signature = (name, obj))]
-    fn bind_object(&self, py: Python<'_>, name: String, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn bind_object(
+        &self,
+        py: Python<'_>,
+        name: String,
+        obj: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyDict>> {
         let handle = self
             .handle
             .borrow()
@@ -354,6 +388,7 @@ impl Runtime {
             .map_err(|_| PyRuntimeError::new_err("bind_object expects a dict with string keys"))?;
 
         let mut bindings = Vec::with_capacity(dict.len());
+        let tokens = PyDict::new(py);
 
         for (key, value) in dict.iter() {
             let key_str: String = key.extract()?;
@@ -369,6 +404,7 @@ impl Runtime {
                 let op_id = handle
                     .register_op(op_name, mode_enum, handler_py)
                     .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
+                tokens.set_item(&key_str, op_id)?;
                 bindings.push(BoundObjectProperty::Op {
                     key: key_str,
                     op_id,
@@ -383,10 +419,12 @@ impl Runtime {
             }
         }
 
+        // `bind_object` exposes the op capabilities itself, but only after
+        // `__peno_bind_object` has actually installed them (see runner.rs).
         handle
             .bind_object(name, bindings)
             .map_err(|e| runtime_error_with_context("Failed to bind object", e))?;
-        Ok(())
+        Ok(tokens.unbind())
     }
 
     fn set_module_resolver(&self, _py: Python<'_>, resolver: Py<PyAny>) -> PyResult<()> {
