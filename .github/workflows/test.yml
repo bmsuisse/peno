@@ -1,0 +1,138 @@
+name: Tests
+
+# The first workflow in this repo that actually runs the test suite. Before
+# this, `.github/workflows/` held only publish-on-release, benchmarks and
+# docs, so every "the tests pass" claim was local and unverified.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A `>=` floor on the collected test count, not an equality check: adding
+  # tests never needs a bump here, only deleting them does. This is the
+  # assertion that makes a mass-skip fail the job -- see
+  # `scripts/check_test_report.py` for the full rationale.
+  MIN_PYTHON_TESTS: "477"
+  # Skips are unverified tests, so the budget is zero. The suite has exactly
+  # one conditional skip (`tests/test_idle_cpu.py`, skipped above 16 CPUs) and
+  # GitHub's macOS runners are well under that, so zero is correct here. Every
+  # skip is printed with its reason regardless, so a new one is visible before
+  # anyone tolerates it.
+  MAX_SKIPPED: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Debug and release are separate jobs on purpose. The library's headline
+  # invariant -- guest JS gets a result or a catchable exception, never a host
+  # crash -- silently depended on `-O` shrinking the recursive serializer's
+  # stack frames: `rt.eval("[" * 80 + "]" * 80)` killed the process on a debug
+  # build and was refused cleanly on a release build. A release-only CI job
+  # cannot see that class of bug at all.
+  pytest:
+    name: pytest (${{ matrix.profile }})
+    # macos-latest, matching `benchmarks.yml`: the Linux cdylib build currently
+    # fails to link V8 (rust-lld TLS relocation vs `-shared`), a pre-existing
+    # issue tracked separately. Moving these jobs to Linux is a follow-up, and
+    # would want a `manylinux: 2_28` container -- the pinned `deno_core`'s V8
+    # needs glibc >= 2.27.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: debug
+            maturin_args: ""
+          - profile: release
+            maturin_args: "--release"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.profile }}
+
+      - name: Build the extension (${{ matrix.profile }})
+        run: |
+          uv sync --frozen --group all
+          uv run maturin develop --uv ${{ matrix.maturin_args }}
+
+      # Collection is a separate step so a collection error (which removes
+      # every test in the offending file) fails the job on its own exit code,
+      # before anything has had a chance to look green.
+      - name: Collect tests
+        run: |
+          uv run python -m pytest tests/ --co -q \
+            -p no:randomly --strict-markers --strict-config \
+            | tee collect-${{ matrix.profile }}.log
+
+      - name: Run pytest
+        # `continue-on-error` is deliberate: a red suite must still reach the
+        # report check below, which is what turns "the process died at test 46"
+        # into a legible error instead of a bare exit code.
+        continue-on-error: true
+        id: pytest
+        run: |
+          uv run python -m pytest tests/ -v \
+            -p no:randomly --strict-markers --strict-config \
+            --junitxml=junit-${{ matrix.profile }}.xml
+
+      - name: Check the test report for skipped or unrun tests
+        run: |
+          uv run python scripts/check_test_report.py \
+            --label "pytest ${{ matrix.profile }}" \
+            --junit junit-${{ matrix.profile }}.xml \
+            --collect-log collect-${{ matrix.profile }}.log \
+            --min-tests "$MIN_PYTHON_TESTS" \
+            --max-skipped "$MAX_SKIPPED"
+
+      - name: Fail if pytest itself failed
+        if: steps.pytest.outcome != 'success'
+        run: |
+          echo "::error::pytest exited non-zero in the ${{ matrix.profile }} profile"
+          exit 1
+
+  cargo-test:
+    name: cargo test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # `--test-threads=1` is this repo's convention: several tests share
+      # process-global V8 platform state, and the Rust suite is not safe to
+      # interleave.
+      - name: cargo test
+        run: cargo test --release --features bench -- --test-threads=1
+
+  lint:
+    name: lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --tests -- -D warnings
+
+      - name: ruff check
+        run: uv tool run ruff check python/peno tests scripts
+
+      - name: ruff format
+        run: uv tool run ruff format --check python/peno tests scripts

@@ -91,7 +91,7 @@
 //! left to fire later against a different context.
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
-use crate::runtime::js_value::JSValue;
+use crate::runtime::js_value::{JSValue, RUNTIME_THREAD_STACK_SIZE};
 use deno_core::{serde_v8, v8, JsRuntime};
 use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
@@ -123,6 +123,9 @@ impl Worker {
         let (tx, rx) = std_mpsc::channel::<PoolCommand>();
         thread::Builder::new()
             .name("peno-isolate-pool-worker".to_string())
+            // Same reason as the runtime thread: this thread owns a V8 isolate
+            // and runs the recursive JSValue serializers.
+            .stack_size(RUNTIME_THREAD_STACK_SIZE)
             .spawn(move || worker_loop(rx))
             .expect("failed to spawn isolate pool worker thread");
         Worker { tx }

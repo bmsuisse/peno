@@ -11,7 +11,9 @@ use crate::runtime::inspector::{
     InspectorConnectionState, InspectorMetadata, InspectorRegistration,
     InspectorRegistrationParams, InspectorServer,
 };
-use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::js_value::{
+    JSValue, LimitTracker, SerializationLimits, RUNTIME_THREAD_STACK_SIZE,
+};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
 use crate::runtime::stats::{
@@ -2083,6 +2085,10 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
 
     thread::Builder::new()
         .name("peno-deno-runtime".to_string())
+        // This thread owns the V8 isolate and runs the recursive JSValue
+        // serializers, which descend once per nesting level up to
+        // `MAX_JS_DEPTH`. See `RUNTIME_THREAD_STACK_SIZE` for the measurement.
+        .stack_size(RUNTIME_THREAD_STACK_SIZE)
         .spawn(move || {
             let _thread_guard = RuntimeThreadGuard::new();
             let tokio_rt = tokio::runtime::Builder::new_current_thread()

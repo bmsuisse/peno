@@ -16,6 +16,31 @@ pub const MAX_JS_DEPTH: usize = 100;
 /// Maximum size in bytes for JavaScript value serialization
 pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 
+/// Stack size for every thread that may run V8 or the recursive
+/// `JSValue` serializers.
+///
+/// Rust's default for a spawned thread is 2 MiB, which is **not** enough. The
+/// V8<->`JSValue` converters (`value_to_js_value_internal`, `js_value_to_v8`,
+/// `js_value_to_python`, `python_to_js_value`) recurse once per nesting level
+/// up to [`MAX_JS_DEPTH`], and an unoptimized build does not merge or shrink
+/// those frames.
+///
+/// Measured on `main` @ 40eb47d, macOS arm64, `dev` profile
+/// (`unoptimized + debuginfo`), by printing the address of a stack local at
+/// every level of `value_to_js_value_internal` while evaluating
+/// `"[" * 50 + "]" * 50`: the stride between consecutive frames was a
+/// perfectly uniform **28_336 bytes**. A full [`MAX_JS_DEPTH`] descent
+/// therefore needs ~2.83 MB of stack for the serializer alone -- past the
+/// 2 MiB default, which is exactly why `rt.eval("[" * 80 + "]" * 80)` used to
+/// die with SIGBUS on a debug build while passing on a release build, where
+/// `-O` shrinks the same frames below the limit.
+///
+/// 16 MiB is ~5.6x the measured debug requirement, leaving room for V8's own
+/// stack limit (~1 MiB), the `deno_core`/tokio frames above the converter, and
+/// future growth in the converters themselves. It is only a *reservation*:
+/// pages are committed lazily, so an idle runtime thread does not pay for it.
+pub const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Configurable serialization limits applied during Python<->JS transfers.
 #[derive(Clone, Copy, Debug)]
 pub struct SerializationLimits {
