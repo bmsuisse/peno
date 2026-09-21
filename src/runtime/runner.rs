@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -135,12 +135,38 @@ struct TerminationState {
     isolate_handle: v8::IsolateHandle,
     /// Optional reason describing why termination was requested.
     reason: Mutex<Option<String>>,
+    /// The dispatcher's wake handle -- the same `Notify` that backs
+    /// `DispatcherWaker`.
+    ///
+    /// `request()` signals this so the `2b.` block in `RuntimeDispatcher::run`
+    /// observes an off-thread termination *immediately* rather than on the next
+    /// `PENDING_WORK_TICK`. Without it the tick is load-bearing for
+    /// parked-promise termination, which is what made it impossible to raise
+    /// the tick (the `test_parked_termination` suite failed outright at a
+    /// raised tick before this existed).
+    dispatcher_wake: Arc<tokio::sync::Notify>,
+}
+
+/// Shared cancel/fire state between a [`SyncWatchdog`] and the runtime thread
+/// that owns it.
+///
+/// `cancelled` is a real state variable guarded by the mutex rather than a
+/// bare flag, so there is no lost-wakeup window: a cancel that lands before
+/// the watchdog thread first takes the lock is already visible at the top of
+/// its wait loop, and one that lands mid-wait is delivered by the condvar.
+struct WatchdogSignal {
+    /// Set once the owning thread has asked the watchdog to stand down.
+    cancelled: Mutex<bool>,
+    /// Signalled by `cancel`; waited on by the watchdog thread.
+    cancel_signal: Condvar,
+    /// Set by the watchdog iff it reached its deadline and terminated V8.
+    /// Only read after `join`, which supplies the ordering.
+    fired: AtomicBool,
 }
 
 struct SyncWatchdog {
     handle: thread::JoinHandle<()>,
-    fired: Arc<AtomicBool>,
-    cancel_flag: Arc<AtomicBool>,
+    signal: Arc<WatchdogSignal>,
     duration: Duration,
 }
 
@@ -150,32 +176,47 @@ impl SyncWatchdog {
         termination: TerminationController,
         reason: impl Into<String>,
     ) -> RuntimeResult<Self> {
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_thread = fired.clone();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_for_thread = cancel_flag.clone();
+        let signal = Arc::new(WatchdogSignal {
+            cancelled: Mutex::new(false),
+            cancel_signal: Condvar::new(),
+            fired: AtomicBool::new(false),
+        });
+        let signal_for_thread = signal.clone();
         let reason = reason.into();
 
         let handle = thread::Builder::new()
             .name("peno-sync-watchdog".to_string())
             .spawn(move || {
                 let deadline = Instant::now() + duration;
+                // A poisoned mutex here is not a reason to stop enforcing the
+                // deadline, so recover the guard rather than panicking.
+                let mut cancelled = signal_for_thread
+                    .cancelled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
                 loop {
-                    if cancel_for_thread.load(Ordering::Acquire) {
+                    if *cancelled {
                         return;
                     }
 
-                    let now = Instant::now();
-                    if now >= deadline {
-                        fired_for_thread.store(true, Ordering::Release);
-                        termination.ensure_reason(reason.clone());
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        signal_for_thread.fired.store(true, Ordering::Release);
+                        // Do not hold the lock across the V8 call.
+                        drop(cancelled);
+                        termination.ensure_reason(reason);
                         termination.terminate_execution();
                         return;
                     }
 
-                    let remaining = deadline.saturating_duration_since(now);
-                    let sleep_dur = remaining.min(Duration::from_millis(10));
-                    thread::sleep(sleep_dur);
+                    // Waits until cancelled or the deadline arrives -- whichever
+                    // comes first -- so a cancel costs a wakeup, not a sleep.
+                    cancelled = signal_for_thread
+                        .cancel_signal
+                        .wait_timeout(cancelled, remaining)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0;
                 }
             })
             .map_err(|e| {
@@ -184,10 +225,28 @@ impl SyncWatchdog {
 
         Ok(Self {
             handle,
-            fired,
-            cancel_flag,
+            signal,
             duration,
         })
+    }
+
+    /// Ask the watchdog to stand down, waking it immediately.
+    ///
+    /// This is the hot path: every timed call cancels its watchdog on the way
+    /// out and then `join`s it. When the watchdog polled a flag behind a 10ms
+    /// `thread::sleep`, that join blocked for the remainder of the current
+    /// sleep chunk -- a fixed ~13ms (macOS `sleep` overshoots a 10ms request)
+    /// on *every* call with a deadline armed, regardless of the deadline's
+    /// value. Signalling the condvar instead makes the join immediate.
+    fn cancel(&self) {
+        let mut cancelled = self
+            .signal
+            .cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cancelled = true;
+        drop(cancelled);
+        self.signal.cancel_signal.notify_one();
     }
 }
 
@@ -254,12 +313,20 @@ impl TerminationController {
                 status: AtomicU8::new(TERMINATION_STATUS_RUNNING),
                 isolate_handle,
                 reason: Mutex::new(None),
+                dispatcher_wake: Arc::new(tokio::sync::Notify::new()),
             }),
         }
     }
 
+    /// The dispatcher's wake handle, so `run` can await the same `Notify` that
+    /// `request()` signals.
+    fn dispatcher_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.dispatcher_wake.clone()
+    }
+
     pub fn request(&self) -> bool {
-        self.inner
+        let first = self
+            .inner
             .status
             .compare_exchange(
                 TERMINATION_STATUS_RUNNING,
@@ -267,7 +334,12 @@ impl TerminationController {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .is_ok()
+            .is_ok();
+        // Wake the dispatcher whether or not this was the first request: a
+        // repeat request still wants the flag observed promptly, and a spurious
+        // wake only costs one extra loop iteration.
+        self.inner.dispatcher_wake.notify_one();
+        first
     }
 
     pub fn terminate_execution(&self) {
@@ -438,13 +510,15 @@ pub enum RuntimeCommand {
 /// of a core and only applies for the bounded stretch during which async work
 /// is genuinely outstanding.
 ///
-/// It is also what bounds `TerminationHandle::terminate` against a runtime
-/// parked on a pending promise. `terminate_execution()` alone cannot help
-/// there -- it only trips when V8 next enters JavaScript, and a
-/// drained-but-pending event loop never does -- so the `2b.` block in `run`
-/// reads the termination flag directly instead, and this tick is what
-/// guarantees it is reached promptly (measured ~1.4-1.8ms median). Before that
-/// check existed such a runtime was unkillable.
+/// Nothing depends on it for termination any more. The `2b.` block in `run`
+/// reads the termination flag directly, because `terminate_execution()` cannot
+/// reach a runtime parked on a pending promise -- it only trips when V8 next
+/// enters JavaScript, and a drained-but-pending event loop never does. That
+/// check used to be reached only on this tick, which quietly made the tick
+/// load-bearing: raising it failed `tests/test_parked_termination.py` outright.
+/// `TerminationController::request` now signals the waker, so the check is
+/// reached on the next loop iteration (~0.3ms median, down from ~1.4-1.9ms)
+/// and this tick is free to be a backstop again.
 const PENDING_WORK_TICK: Duration = Duration::from_millis(1);
 
 /// Waker handed to `poll_event_loop`, replacing the `noop_waker` this
@@ -530,7 +604,12 @@ impl RuntimeDispatcher {
     async fn run(&mut self) {
         // One waker for the whole loop. See `DispatcherWaker`: this replaces a
         // `noop_waker`, and is what makes parking possible at all.
-        let notify = Arc::new(tokio::sync::Notify::new());
+        //
+        // It is owned by the `TerminationController` so that an off-thread
+        // `terminate()` can signal it too -- see `TerminationState`'s
+        // `dispatcher_wake`. Both sources mean the same thing to this loop
+        // ("something changed, re-poll"), so they share one handle.
+        let notify = self.core.termination.dispatcher_wake();
         let waker = futures::task::waker(Arc::new(DispatcherWaker(notify.clone())));
 
         loop {
@@ -639,10 +718,12 @@ impl RuntimeDispatcher {
             // observed and the caller blocked on its result channel forever --
             // `new Promise(() => {})` was unkillable.
             //
-            // Checking the flag here closes that hole without any new timer:
-            // a runtime with a job in flight is already waking at least every
-            // `PENDING_WORK_TICK`, so this is observed within a tick (measured
-            // ~1ms; see BENCHMARKS.md) and costs one atomic load per iteration.
+            // Checking the flag here closes that hole without any new timer,
+            // and costs one atomic load per iteration. `request()` signals the
+            // dispatcher's waker, so this is reached on the very next iteration
+            // (~0.3ms median; see BENCHMARKS.md) rather than on the next
+            // `PENDING_WORK_TICK` -- which is what keeps the tick a backstop
+            // instead of the mechanism this depends on.
             //
             // This is the *polite* tier and deliberately does not recreate
             // anything: bound host functions, module state and the isolate are
@@ -2627,11 +2708,11 @@ impl RuntimeCoreState {
     }
 
     fn resolve_sync_watchdog(&mut self, watchdog: SyncWatchdog) -> RuntimeResult<(bool, Duration)> {
-        watchdog.cancel_flag.store(true, Ordering::Release);
+        watchdog.cancel();
         if watchdog.handle.join().is_err() {
             return Err(RuntimeError::internal("Watchdog thread panicked"));
         }
-        let fired = watchdog.fired.load(Ordering::Acquire);
+        let fired = watchdog.signal.fired.load(Ordering::Acquire);
         if fired {
             let isolate = self.js_runtime.v8_isolate();
             let _ = isolate.cancel_terminate_execution();
